@@ -3,7 +3,8 @@ __pycache__/
 .venv/
 .env
 *.log
-*.json
-*.txt
 *.pdf
 !豐泰.pdf
+
+# 解析結果集中於 output/，不納入版控
+output/

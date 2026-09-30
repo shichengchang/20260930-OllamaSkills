@@ -200,8 +200,7 @@ run.bat
 
 ```powershell
 # 路線 C
-python pdf_text_fentay.py --pdf ".\豐泰.pdf" --out ".\result.C.json" `
-  --compare ".\expected.json" --dump-columns
+python pdf_text_fentay.py --pdf ".\豐泰.pdf" --compare ".\expected.json"
 
 # 路線 B（hybrid：規則由 Python 套用）
 python ollama_fentay.py --pdf ".\豐泰.pdf" --skill-dir ".\FENTAY_B2B" `
@@ -211,6 +210,52 @@ python ollama_fentay.py --pdf ".\豐泰.pdf" --skill-dir ".\FENTAY_B2B" `
 python ollama_fentay.py --pdf ".\豐泰.pdf" --skill-dir ".\FENTAY_B2B" `
   --model qwen3.5:4b --mode pure --compare ".\expected.json"
 ```
+
+---
+
+## 輸出
+
+所有結果集中寫入 `output/`，專案根目錄保持乾淨。
+
+```
+output/
+├── result.C.json
+├── result.C.json.report.txt
+├── result.qwen3.5_4b.hybrid.json
+├── result.qwen3.5_4b.hybrid.report.txt
+└── ...
+```
+
+每個 JSON 都附帶 `_meta` 區塊記錄來源與時間：
+
+```json
+{
+  "success": true,
+  "recordCount": 38,
+  "data": [ ... ],
+  "_meta": {
+    "generatedAt": "2026-09-30T14:25:40+08:00",
+    "startedAt": "2026-09-30T14:23:44+08:00",
+    "elapsedSec": 116.472,
+    "source": {
+      "route": "B",
+      "mode": "hybrid",
+      "model": "qwen3.5:4b",
+      "pdf": "豐泰.pdf",
+      "dpi": 200,
+      "pages": 2
+    }
+  }
+}
+```
+
+時間為台灣時區（UTC+8）。`_meta` 放在獨立區塊而非頂層，
+是為了不影響既有的 `{success, recordCount, data}` 結構，
+下游取用 `data` 的程式碼無需修改。
+
+報告檔（`.report.txt`）開頭也記錄產出時間、開始時間與耗時。
+
+用 `--out-dir` 可改變輸出位置。
 
 ### 常用參數
 

@@ -70,7 +70,7 @@ REM ------------------------------------------------------------
 cls
 echo [1/1] Route C: parsing PDF text layer (no LLM)...
 echo.
-%PY% pdf_text_fentay.py --pdf "%PDF%" --out "result.C.json" --compare "expected.json" --dump-columns
+%PY% pdf_text_fentay.py --pdf "%PDF%" --compare "expected.json" --dump-columns
 goto pause_menu
 
 REM ------------------------------------------------------------

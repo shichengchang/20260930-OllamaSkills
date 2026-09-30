@@ -15,8 +15,10 @@ pdf_text_fentay.py - 方案 C：直接解析 PDF 文字層，輸出 FENTAY_B2B �
     因此必須以座標分組成列，不可依賴文字輸出的先後順序。
 
 用法：
-    python pdf_text_fentay.py --pdf ".\\豐泰.pdf" --out ".\\result.C.json" \
+    python pdf_text_fentay.py --pdf ".\\豐泰.pdf" \
         --compare ".\\expected.json" --dump-columns
+
+結果預設寫入專案下的 output/。
 """
 
 import argparse
