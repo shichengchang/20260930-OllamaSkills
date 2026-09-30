@@ -1,0 +1,8 @@
+__pycache__/
+.vscode/
+.venv/
+.env
+*.log
+
+*.pdf
+!豐泰.pdf
