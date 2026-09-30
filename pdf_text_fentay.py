@@ -31,8 +31,8 @@ except ImportError:
     sys.exit("缺少 PyMuPDF，請執行: pip install PyMuPDF")
 
 from fentay_common import (
-    HEADER_ALIASES, apply_mapping, compare, log, normalize_key, to_number,
-    validate,
+    HEADER_ALIASES, apply_mapping, build_output, compare, log, now_iso,
+    normalize_key, resolve_out_dir, to_number, validate,
 )
 
 # PDF 表頭的實際欄位順序，用於第 3 層備援與欄位語意判定。
@@ -403,7 +403,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="方案 C：直接解析 PDF 文字層為 FENTAY_B2B JSON")
     parser.add_argument("--pdf", required=True, help="PDF 路徑")
-    parser.add_argument("--out", default="result.C.json", help="輸出 JSON 路徑")
+    parser.add_argument("--out", default=None,
+                        help="輸出 JSON 路徑，預設 output/result.C.json")
+    parser.add_argument("--out-dir", default=None,
+                        help="輸出目錄，預設為專案下的 output/")
     parser.add_argument("--compare", default=None, help="基準答案 JSON 路徑")
     parser.add_argument("--report", default=None, help="報告路徑，預設與 out 同名加 .report.txt")
     parser.add_argument("--show-diffs", type=int, default=10)
@@ -413,6 +416,10 @@ def main():
     if not os.path.isfile(args.pdf):
         sys.exit("找不到 PDF: %s" % args.pdf)
 
+    out_dir = resolve_out_dir(args.out_dir)
+    args.out = args.out or os.path.join(out_dir, "result.C.json")
+
+    started_at = now_iso()
     started = time.time()
     log("解析 PDF: %s" % os.path.basename(args.pdf))
     result = {"success": True, "recordCount": 0, "data": []}
@@ -424,17 +431,30 @@ def main():
         log("[error] 解析失敗: %s" % exc)
     elapsed = time.time() - started
 
-    out_dir = os.path.dirname(os.path.abspath(args.out))
-    if out_dir and not os.path.isdir(out_dir):
-        sys.exit("輸出目錄不存在: %s" % out_dir)
+    build_output(
+        result,
+        source={
+            "route": "C",
+            "mode": "text-layer",
+            "model": None,
+            "pdf": os.path.basename(args.pdf),
+            "pages": len(diagnostics["pages"]),
+        },
+        elapsed_sec=elapsed,
+        started_at=started_at,
+    )
+
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
     problems = validate(result)
     report = [
-        "來源: C (PDF 文字層直接解析，未使用 LLM)",
-        "輸出: %s" % args.out,
+        "產出時間: %s" % result["_meta"]["generatedAt"],
+        "開始時間: %s" % started_at,
         "耗時: %.3f 秒" % elapsed,
+        "來源: 路線 C (PDF 文字層直接解析，未使用 LLM)",
+        "輸入 PDF: %s" % os.path.basename(args.pdf),
+        "輸出 JSON: %s" % args.out,
         "recordCount: %d / data 長度: %d" % (result["recordCount"], len(result["data"])),
         "",
         "=== 分頁診斷 ===",
@@ -492,7 +512,7 @@ def main():
     log(report_text)
     log("")
     log("已輸出: %s / %s" % (args.out, report_path))
-    log("耗時 %.3f 秒" % elapsed)
+    log("輸出目錄: %s" % out_dir)
 
 
 if __name__ == "__main__":

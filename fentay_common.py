@@ -22,8 +22,16 @@ fentay_common.py - FENTAY_B2B 共用層：MAPPING.md 規則實作與輸出契約
   - prompt 組裝與 Ollama API    -> ollama_fentay.py 專用
 """
 
+import os
 import re
 import sys
+from datetime import datetime, timedelta, timezone
+
+# 預設輸出資料夾，所有解析結果集中於此，避免散落在專案根目錄
+DEFAULT_OUT_DIR = "output"
+
+# 台灣時區（UTC+8）。PDF 訂單為台灣廠商，使用當地時間較符合閱讀習慣。
+TAIWAN_TZ = timezone(timedelta(hours=8))
 
 # ---------------------------------------------------------------- 欄位定義
 
@@ -66,6 +74,48 @@ HEADER_IGNORED = ["金額", "小計", "合計", "Amount", "Total"]
 def log(msg):
     """進度訊息一律寫 stderr，避免污染 stdout 的 JSON 輸出。"""
     print(msg, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------- 輸出與時間
+
+def now_iso():
+    """回傳台灣時區的 ISO 8601 時間字串，例如 2026-09-30T14:35:12+08:00。"""
+    return datetime.now(TAIWAN_TZ).isoformat(timespec="seconds")
+
+
+def timestamp_slug():
+    """回傳適合檔名的時間戳，例如 20260930-143512。"""
+    return datetime.now(TAIWAN_TZ).strftime("%Y%m%d-%H%M%S")
+
+
+def resolve_out_dir(out_dir=None):
+    """
+    決定輸出目錄，預設為專案下的 output/，不存在則建立。
+    回傳絕對路徑。
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    target = os.path.join(base, out_dir or DEFAULT_OUT_DIR)
+    os.makedirs(target, exist_ok=True)
+    return target
+
+
+def build_output(result, source, elapsed_sec=None, started_at=None):
+    """
+    在結果物件加上 _meta 區塊，記錄來源與時間。
+
+    放在 _meta 而非頂層，是為了不影響既有的
+    {success, recordCount, data} 結構，呼叫端仍可直接取用 data。
+    """
+    meta = {
+        "generatedAt": now_iso(),
+        "source": source,
+    }
+    if started_at:
+        meta["startedAt"] = started_at
+    if elapsed_sec is not None:
+        meta["elapsedSec"] = round(elapsed_sec, 3)
+    result["_meta"] = meta
+    return result
 
 
 # ---------------------------------------------------------------- 標題比對

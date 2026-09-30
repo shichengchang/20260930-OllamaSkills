@@ -18,7 +18,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)
 
-from fentay_common import compare, log, validate
+from fentay_common import DEFAULT_OUT_DIR, compare, log, now_iso, validate
 
 DEFAULT_BASELINE = "expected.json"
 RESULT_PATTERN = "result.*.json"
@@ -45,10 +45,19 @@ def load(path):
         return json.load(f)
 
 
+def find_results(out_dir):
+    """在輸出目錄內尋找所有結果 JSON。"""
+    pattern = os.path.join(out_dir, RESULT_PATTERN)
+    return sorted(p for p in glob.glob(pattern)
+                  if not p.endswith(".report.txt"))
+
+
 def main():
     parser = argparse.ArgumentParser(description="比較所有解析結果與基準答案")
     parser.add_argument("--baseline", default=DEFAULT_BASELINE,
                         help="基準答案 JSON，預設 %s" % DEFAULT_BASELINE)
+    parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR,
+                        help="結果目錄，預設 %s" % DEFAULT_OUT_DIR)
     parser.add_argument("--show-diffs", type=int, default=3,
                         help="每個檔案顯示的差異筆數")
     args = parser.parse_args()
@@ -56,14 +65,20 @@ def main():
     if not os.path.isfile(args.baseline):
         sys.exit("找不到基準答案: %s" % args.baseline)
 
-    paths = sorted(p for p in glob.glob(RESULT_PATTERN)
-                   if not p.endswith(".report.txt"))
+    if not os.path.isdir(args.out_dir):
+        sys.exit("找不到結果目錄 %s，請先執行解析（run.bat 選項 2 或 3）"
+                 % args.out_dir)
+
+    paths = find_results(args.out_dir)
     if not paths:
-        sys.exit("找不到 %s，請先執行解析（run.bat 選項 2 或 3）" % RESULT_PATTERN)
+        sys.exit("%s 內找不到 %s，請先執行解析（run.bat 選項 2 或 3）"
+                 % (args.out_dir, RESULT_PATTERN))
 
     baseline = load(args.baseline)
     print("=" * 78)
+    print("比較時間: %s" % now_iso())
     print("基準答案: %s (%s 筆)" % (args.baseline, baseline.get("recordCount")))
+    print("結果目錄: %s" % args.out_dir)
     print("=" * 78)
 
     summary = []
@@ -82,18 +97,24 @@ def main():
             if line.startswith("逐欄正確率"):
                 rate = line.split(":")[-1].strip().split("(")[0].strip()
 
+        meta = actual.get("_meta") or {}
         summary.append({
             "file": os.path.basename(path),
             "source": describe(path),
             "count": actual.get("recordCount"),
             "rate": rate,
             "issues": len(problems),
+            "generated": meta.get("generatedAt", "-"),
+            "elapsed": meta.get("elapsedSec"),
         })
 
         print()
         print("-" * 78)
         print("%s" % os.path.basename(path))
         print("  來源: %s" % describe(path))
+        print("  產出時間: %s" % meta.get("generatedAt", "(無記錄)"))
+        if meta.get("elapsedSec") is not None:
+            print("  耗時: %.3f 秒" % meta["elapsedSec"])
         print("-" * 78)
         print(text)
         if problems:
@@ -106,11 +127,13 @@ def main():
     print("=" * 78)
     print("彙總")
     print("=" * 78)
-    print("%-38s %-6s %-8s %s" % ("檔案", "筆數", "正確率", "驗證問題"))
+    print("%-34s %-5s %-7s %-7s %s"
+          % ("檔案", "筆數", "正確率", "耗時(秒)", "產出時間"))
     for item in sorted(summary, key=lambda s: (s["rate"] != "100.0%", s["file"])):
-        print("%-38s %-6s %-8s %d"
-              % (item["file"][:38], item["count"], item["rate"] or "n/a",
-                 item["issues"]))
+        elapsed = ("%.2f" % item["elapsed"]) if item["elapsed"] is not None else "-"
+        print("%-34s %-5s %-7s %-7s %s"
+              % (item["file"][:34], item["count"], item["rate"] or "n/a",
+                 elapsed, item["generated"]))
 
     full = [s for s in summary if s["rate"] == "100.0%"]
     print()

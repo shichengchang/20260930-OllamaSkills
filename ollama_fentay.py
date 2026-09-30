@@ -36,7 +36,9 @@ try:
 except ImportError:
     sys.exit("缺少 PyMuPDF，請執行: pip install PyMuPDF")
 
-from fentay_common import apply_mapping, compare, log, validate
+from fentay_common import (
+    apply_mapping, build_output, compare, log, now_iso, resolve_out_dir, validate,
+)
 
 DEFAULT_HOST = "http://localhost:11434"
 SKILL_FILES = ("SKILL.md", "MAPPING.md", "EXAMPLES.md")
@@ -332,8 +334,9 @@ def main():
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--json-format", choices=["json", "none"], default="json")
-    parser.add_argument("--out-dir", default=None, help="預設與 PDF 同目錄")
-    parser.add_argument("--out-base", default="result", help="輸出檔名前綴")
+    parser.add_argument("--out-dir", default=None,
+                        help="輸出目錄，預設為專案下的 output/")
+    parser.add_argument("--out-base", default="result", help="輸出檔名前綴（不含時間戳）")
     parser.add_argument("--compare", default=None, help="基準答案 JSON 路徑")
     parser.add_argument("--show-diffs", type=int, default=10)
     args = parser.parse_args()
@@ -359,10 +362,7 @@ def main():
         with open(args.compare, "r", encoding="utf-8") as f:
             expected = json.load(f)
 
-    out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.pdf))
-    if not os.path.isdir(out_dir):
-        sys.exit("輸出目錄不存在: %s" % out_dir)
-    args.out_base = os.path.join(out_dir, args.out_base)
+    args.out_base = os.path.join(resolve_out_dir(args.out_dir), args.out_base)
 
     skill_text, skill_count = load_skill(args.skill_dir)
     bands = max(1, args.rows_per_call)
@@ -375,19 +375,47 @@ def main():
     summary = []
     for model in models:
         for mode in modes:
+            started_at = now_iso()
+            call_started = time.time()
             result, stats, error = run_one(args.host, args, model, mode, images, skill_text)
+            elapsed = time.time() - call_started
             problems = validate(result)
+
+            build_output(
+                result,
+                source={
+                    "route": "B",
+                    "mode": mode,
+                    "model": model,
+                    "pdf": os.path.basename(args.pdf),
+                    "dpi": args.dpi,
+                    "pages": len(images),
+                },
+                elapsed_sec=elapsed,
+                started_at=started_at,
+            )
 
             tag = "%s.%s" % (model.replace(":", "_"), mode)
             out_path = "%s.%s.json" % (args.out_base, tag)
+            report_path = "%s.%s.report.txt" % (args.out_base, tag)
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
 
-            report = ["模型: %s" % model, "模式: %s" % mode,
-                      "輸出: %s" % out_path,
-                      "recordCount: %s / data 長度: %d"
-                      % (result.get("recordCount"), len(result.get("data", []))),
-                      "", "驗證問題 (%d):" % len(problems)]
+            report = [
+                "產出時間: %s" % result["_meta"]["generatedAt"],
+                "開始時間: %s" % started_at,
+                "耗時: %.1f 秒" % elapsed,
+                "來源: 路線 B (PDF 轉 PNG 後由 vision 模型解析)",
+                "模型: %s" % model,
+                "模式: %s" % mode,
+                "輸入 PDF: %s (%d dpi, %d 張圖)"
+                % (os.path.basename(args.pdf), args.dpi, len(images)),
+                "輸出 JSON: %s" % out_path,
+                "recordCount: %s / data 長度: %d"
+                % (result.get("recordCount"), len(result.get("data", []))),
+                "",
+                "驗證問題 (%d):" % len(problems),
+            ]
             report.extend("  - " + p for p in problems[:20])
             if expected is not None:
                 report.append("")
@@ -395,7 +423,6 @@ def main():
                 report.append(compare(expected, result, args.show_diffs))
 
             report_text = "\n".join(report)
-            report_path = "%s.%s.report.txt" % (args.out_base, tag)
             with open(report_path, "w", encoding="utf-8") as f:
                 f.write(report_text)
             log("")
@@ -407,16 +434,18 @@ def main():
                 "model": model, "mode": mode,
                 "recordCount": result.get("recordCount"),
                 "validation_issues": len(problems),
-                "elapsed_sec": round(sum(s.get("elapsed_sec", 0) for s in stats), 1),
+                "elapsed_sec": round(elapsed, 1),
                 "report": report_path,
             })
 
     log("")
     log("===== 彙總 =====")
+    log("  產出時間: %s" % now_iso())
     for item in summary:
         log("  %-14s %-7s recordCount=%-4s 驗證問題=%-3d 耗時=%.1fs"
             % (item["model"], item["mode"], item["recordCount"],
                item["validation_issues"], item["elapsed_sec"]))
+    log("  輸出目錄: %s" % os.path.dirname(args.out_base))
 
 
 if __name__ == "__main__":
