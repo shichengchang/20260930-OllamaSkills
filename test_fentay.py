@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """ollama_fentay.py 與 pdf_text_fentay.py 的單元測試。"""
 import importlib.util
+import json
 import os
 import sys
 
@@ -129,6 +130,58 @@ m.apply_mapping({"訂購單號": "X", "金額": "1,000.00", "數量": "1"}, drop
 ok("金額" in dropped3, "金額欄位被標記為略過")
 
 ok(len(m.FIELDS) == 12, "FIELDS 共 12 欄")
+
+print("=== OCR 失真修正：色碼 O/0 混淆 ===")
+Q3 = chr(34)
+fix_cases = [
+    # (輸入, 是否應修正, 說明)
+    ("OAVLJA4497K9EPM5回網/(0AV)", True, "前綴 OAV 與括號 0AV 不一致 -> 修正為 0AV"),
+    ("OBG A2279-2EPM5保利2/(0BG)", True, "前綴 OBG 與括號 0BG 不一致 -> 修正為 0BG"),
+    ("0AVLJA4497K9EPM5回網/(0AV)", False, "前綴已正確，不動（路線 C 安全性）"),
+    ("06F A2279-2EPM5保利2/(06F)", False, "首字元皆為 0，不一致條件不成立"),
+    ("2CQ A2279-2EPM5保利2/(2CQ)", False, "首字元非 0/O，不觸發"),
+    ('44"74F黃LJ-A8-P網布/(74F)', False, "非 0/O 開頭，不觸發"),
+    ('44" 黑保利2 CDP布/(00A)', False, "無色碼前綴，漏空格不在此規則範圍"),
+    ('56"P28黑特利', False, "無括號色碼，不觸發"),
+    ("XYZabc/(00A)", False, "字母不同，不觸發"),
+    ("", False, "空字串不觸發"),
+    (None, False, "None 不觸發"),
+]
+for value, should_fix, desc in fix_cases:
+    got, changed = m.fix_ocr_color_code(value)
+    ok(changed == should_fix, desc)
+
+print("=== OCR 修正後的字串正確性 ===")
+got, changed = m.fix_ocr_color_code("OAVLJA4497K9EPM5回網/(0AV)")
+ok(got == "0AVLJA4497K9EPM5回網/(0AV)", "OAVLJA -> 0AVLJA（只有首字元被改）")
+got, changed = m.fix_ocr_color_code("OBG A2279-2EPM5保利2/(0BG)")
+ok(got == "0BG A2279-2EPM5保利2/(0BG)", "OBG -> 0BG")
+ok(len("OBG A2279-2EPM5保利2/(0BG)") == len("0BG A2279-2EPM5保利2/(0BG)"),
+   "修正後字串長度不變")
+
+print("=== apply_ocr_fixes 批次處理 ===")
+records = [
+    {"ORD_NO": "6AF1105", "MATM_DESC": "OAVLJA4497K9EPM5回網/(0AV)"},
+    {"ORD_NO": "6AF1112", "MATM_DESC": "OBG A2279-2EPM5保利2/(0BG)"},
+    {"ORD_NO": "6AF1101", "MATM_DESC": '44"74F黃LJ-A8-P網布/(74F)'},
+]
+records, count = m.apply_ocr_fixes(records)
+ok(count == 2, "批次修正 2 筆")
+ok(records[0]["MATM_DESC"].startswith("0AV"), "第 1 筆已修正")
+ok(records[1]["MATM_DESC"].startswith("0BG"), "第 2 筆已修正")
+ok(records[2]["MATM_DESC"] == '44"74F黃LJ-A8-P網布/(74F)', "第 3 筆未變動")
+
+print("=== 對基準答案與路線 C 結果為 no-op ===")
+for path in ("expected.json", "output/result.C.json"):
+    if not os.path.isfile(path):
+        continue
+    with open(path, "r", encoding="utf-8") as f:
+        before = json.load(f)["data"]
+    _, hits = m.apply_ocr_fixes([dict(r) for r in before])
+    ok(hits == 0, "%s 不受 OCR 修正影響（%d 筆變動）" % (path, hits))
+
+print("=== 預設 DPI ===")
+ok(m.DEFAULT_DPI == 400, "DEFAULT_DPI = 400")
 
 print("=== validate ===")
 good = {"success": True, "recordCount": 1, "data": [dict(expect)]}

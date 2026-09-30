@@ -30,6 +30,17 @@ from datetime import datetime, timedelta, timezone
 # 預設輸出資料夾，所有解析結果集中於此，避免散落在專案根目錄
 DEFAULT_OUT_DIR = "output"
 
+# PDF 轉圖時的預設解析度。
+#
+# 選 400 的理由：vision 模型在 8pt 中文字時，200 DPI 僅約 22px 字高，
+# 數字 0 與字母 O 的字形幾乎無法區分。400 DPI 約 44px 字高即可分辨。
+#
+# 上限依模型而異，請勿盲目提高：
+#   qwen3.5 視覺面積上限 16,777,216 px²，400 DPI 約 11.27M，安全；450 DPI 為極限
+#   gemma4 為固定解析度架構，提高 DPI 無實益
+# 視覺 token 數約為 像素數 / 1024，200 DPI 約 2,753；400 DPI 約 11,007。
+DEFAULT_DPI = 400
+
 # 台灣時區（UTC+8）。PDF 訂單為台灣廠商，使用當地時間較符合閱讀習慣。
 TAIWAN_TZ = timezone(timedelta(hours=8))
 
@@ -267,6 +278,64 @@ def apply_mapping(row, dropped=None):
     for field in FIXED_EMPTY_FIELDS:
         record[field] = ""
     return record
+
+
+# ---------------------------------------------------------------- OCR 失真修正
+
+# MATM_DESC 開頭的色碼，例如 0AVLJA4497K9EPM5回網/(0AV) 的「0AV」
+_PREFIX_COLOR_CODE = re.compile(r"^([0O])([A-Z]{2})")
+# MATM_DESC 尾端的括號色碼，例如同例的「(0AV)」
+_PAREN_COLOR_CODE = re.compile(r"/\(([0O])([A-Z]{2})\)")
+
+
+def fix_ocr_color_code(desc):
+    """
+    修正 MATM_DESC 開頭色碼的 O/0 混淆（vision OCR 失真）。
+
+    豐泰訂單的材料名稱常以色碼開頭，且同一筆的尾端括號會重複該色碼，
+    例如 0AVLJA4497K9EPM5回網/(0AV)。vision 模型在低解析度下會把
+    數字 0 認成字母 O，造成前綴與括號內不一致。
+
+    僅在下列條件同時成立時修正，其他情況一律不動：
+      1. 前綴碼為 O 或 0 加兩個大寫字母
+      2. 尾端括號內為 O 或 0 加兩個大寫字母
+      3. 兩者後兩個字母完全相同
+      4. 兩者首字元不同（一個 O、一個 0）
+    以數字 0 為準修正。條件嚴格，因此對正常資料為 no-op。
+
+    回傳 (修正後字串, 是否曾修正)。
+    """
+    if not isinstance(desc, str) or not desc:
+        return desc, False
+
+    prefix = _PREFIX_COLOR_CODE.match(desc)
+    paren = _PAREN_COLOR_CODE.search(desc)
+    if not prefix or not paren:
+        return desc, False
+    if prefix.group(2) != paren.group(2):
+        return desc, False
+    if prefix.group(1) == paren.group(1):
+        return desc, False
+
+    index = prefix.start(1)
+    return desc[:index] + "0" + desc[index + 1:], True
+
+
+def apply_ocr_fixes(records):
+    """
+    對整批記錄套用 OCR 失真修正，回傳 (記錄, 修正筆數)。
+
+    路線 C 讀取 PDF 文字層，不會產生此類失真，實測為 no-op；
+    仍統一在此套用，是為了讓兩條路線共用同一份修正規則而不致分歧。
+    """
+    fixed = 0
+    for record in records:
+        desc = record.get("MATM_DESC")
+        corrected, changed = fix_ocr_color_code(desc)
+        if changed:
+            record["MATM_DESC"] = corrected
+            fixed += 1
+    return records, fixed
 
 
 # ---------------------------------------------------------------- 輸出契約

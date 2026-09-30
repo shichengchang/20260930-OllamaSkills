@@ -33,8 +33,8 @@ except ImportError:
     sys.exit("缺少 PyMuPDF，請執行: pip install PyMuPDF")
 
 from fentay_common import (
-    HEADER_ALIASES, apply_mapping, build_output, compare, log, now_iso,
-    normalize_key, resolve_out_dir, timestamp_slug, to_number, validate,
+    HEADER_ALIASES, apply_mapping, apply_ocr_fixes, build_output, compare, log,
+    now_iso, normalize_key, resolve_out_dir, timestamp_slug, to_number, validate,
 )
 
 # PDF 表頭的實際欄位順序，用於第 3 層備援與欄位語意判定。
@@ -435,6 +435,12 @@ def main():
         log("[error] 解析失敗: %s" % exc)
     elapsed = time.time() - started
 
+    # OCR 失真修正。文字層不會產生此類失真，實測為 no-op；
+    # 仍統一套用以維持兩條路線共用同一份規則。
+    result["data"], ocr_fixed = apply_ocr_fixes(result.get("data", []))
+    if ocr_fixed:
+        log("OCR 失真修正: %d 筆" % ocr_fixed)
+
     build_output(
         result,
         source={
@@ -443,6 +449,7 @@ def main():
             "model": None,
             "pdf": os.path.basename(args.pdf),
             "pages": len(diagnostics["pages"]),
+            "ocrColorCodeFixed": ocr_fixed,
         },
         elapsed_sec=elapsed,
         started_at=started_at,
@@ -458,6 +465,7 @@ def main():
         "耗時: %.3f 秒" % elapsed,
         "來源: 路線 C (PDF 文字層直接解析，未使用 LLM)",
         "輸入 PDF: %s" % os.path.basename(args.pdf),
+        "OCR 色碼修正: %d 筆（文字層解析，預期為 0）" % ocr_fixed,
         "輸出 JSON: %s" % args.out,
         "  (JSON 為固定檔名，每次執行覆蓋；本報告檔名含時間戳以保留紀錄)",
         "recordCount: %d / data 長度: %d" % (result["recordCount"], len(result["data"])),

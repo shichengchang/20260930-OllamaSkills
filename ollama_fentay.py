@@ -37,8 +37,8 @@ except ImportError:
     sys.exit("缺少 PyMuPDF，請執行: pip install PyMuPDF")
 
 from fentay_common import (
-    apply_mapping, build_output, compare, log, now_iso, resolve_out_dir,
-    timestamp_slug, validate,
+    DEFAULT_DPI, apply_mapping, apply_ocr_fixes, build_output, compare, log,
+    now_iso, resolve_out_dir, timestamp_slug, validate,
 )
 
 DEFAULT_HOST = "http://localhost:11434"
@@ -322,7 +322,9 @@ def main():
     parser.add_argument("--mode", action="append", default=None,
                         choices=["pure", "hybrid"], help="可重複指定")
     parser.add_argument("--host", default=DEFAULT_HOST)
-    parser.add_argument("--dpi", type=int, default=200)
+    parser.add_argument("--dpi", type=int, default=DEFAULT_DPI,
+                        help="PDF 轉圖解析度，預設 %d。提高可改善小字辨識，"
+                             "但視覺 token 數與耗時會增加" % DEFAULT_DPI)
     parser.add_argument("--rows-per-call", type=int, default=0,
                         help="每頁切幾段分次呼叫；0 表示整頁一次")
     parser.add_argument("--crop-top", type=float, default=0.06,
@@ -383,6 +385,13 @@ def main():
             call_started = time.time()
             result, stats, error = run_one(args.host, args, model, mode, images, skill_text)
             elapsed = time.time() - call_started
+
+            # OCR 失真修正：pure 與 hybrid 兩種模式都套用。
+            # pure 模式下 MATM_DESC 直接來自模型，同樣需要此修正。
+            result["data"], ocr_fixed = apply_ocr_fixes(result.get("data", []))
+            if ocr_fixed:
+                log("  OCR 失真修正: %d 筆（色碼 O/0 混淆）" % ocr_fixed)
+
             problems = validate(result)
 
             build_output(
@@ -394,6 +403,7 @@ def main():
                     "pdf": os.path.basename(args.pdf),
                     "dpi": args.dpi,
                     "pages": len(images),
+                    "ocrColorCodeFixed": ocr_fixed,
                 },
                 elapsed_sec=elapsed,
                 started_at=started_at,
@@ -416,6 +426,7 @@ def main():
                 "模式: %s" % mode,
                 "輸入 PDF: %s (%d dpi, %d 張圖)"
                 % (os.path.basename(args.pdf), args.dpi, len(images)),
+                "OCR 色碼修正: %d 筆" % ocr_fixed,
                 "輸出 JSON: %s" % out_path,
                 "  (JSON 為固定檔名，每次執行覆蓋；本報告檔名含時間戳以保留紀錄)",
                 "recordCount: %s / data 長度: %d"
