@@ -219,12 +219,24 @@ python ollama_fentay.py --pdf ".\豐泰.pdf" --skill-dir ".\FENTAY_B2B" `
 
 ```
 output/
-├── result.C.json
-├── result.C.json.report.txt
+├── result.C.json                                  ← 固定檔名，每次覆蓋
+├── result.C.20260930-145731.report.txt            ← 帶時間戳，保留歷次紀錄
 ├── result.qwen3.5_4b.hybrid.json
-├── result.qwen3.5_4b.hybrid.report.txt
+├── result.qwen3.5_4b.hybrid.20260930-145945.report.txt
+├── result.qwen3.5_4b.hybrid.20260930-151811.report.txt
 └── ...
 ```
+
+**JSON 與報告的差異**
+
+| | JSON | 報告 `.report.txt` |
+|---|---|---|
+| 檔名 | 固定（每次覆蓋） | 帶時間戳 `YYYYMMDD-HHMMSS` |
+| 用途 | 下游取用最新結果 | 保留每次執行紀錄 |
+| 比對 | `compare_results.py` 只讀最新 | 不參與比對 |
+
+報告檔名帶時間戳，因此 `output/` 會隨執行次數累積報告檔。
+需要清理舊報告時可直接刪除帶時間戳的 `.report.txt`，JSON 不受影響。
 
 每個 JSON 都附帶 `_meta` 區塊記錄來源與時間：
 
@@ -254,8 +266,9 @@ output/
 下游取用 `data` 的程式碼無需修改。
 
 報告檔（`.report.txt`）開頭也記錄產出時間、開始時間與耗時。
+檔名格式為 `result.<來源>.<YYYYMMDD-HHMMSS>.report.txt`。
 
-用 `--out-dir` 可改變輸出位置。
+用 `--out-dir` 可改變輸出位置；`pdf_text_fentay.py --report` 可指定報告檔路徑。
 
 ### 常用參數
 
