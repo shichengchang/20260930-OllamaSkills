@@ -57,15 +57,30 @@ def find_results(out_dir):
                   if not p.endswith(".report.txt"))
 
 
+def parse_show(value):
+    """把 --show-diffs 轉為 compare() 接受的整數或 None（None 代表全部）。"""
+    if value is None or str(value).lower() == "all":
+        return None
+    number = int(value)
+    return number if number >= 0 else None
+
+
 def main():
     parser = argparse.ArgumentParser(description="比較所有解析結果與基準答案")
     parser.add_argument("--baseline", default=DEFAULT_BASELINE,
                         help="基準答案 JSON，預設 %s" % DEFAULT_BASELINE)
     parser.add_argument("--out-dir", default=DEFAULT_OUT_DIR,
                         help="結果目錄，預設 %s" % DEFAULT_OUT_DIR)
-    parser.add_argument("--show-diffs", type=int, default=3,
-                        help="每個檔案顯示的差異筆數")
+    parser.add_argument("--show-diffs", default="3",
+                        help="每個檔案顯示的差異筆數，可用 all 顯示全部")
+    parser.add_argument("--full", action="store_true",
+                        help="輸出完整差異清單（依欄位分組），用於診斷")
     args = parser.parse_args()
+
+    try:
+        show = parse_show(args.show_diffs)
+    except ValueError:
+        sys.exit("--show-diffs 需為整數或 all，收到: %s" % args.show_diffs)
 
     if not os.path.isfile(args.baseline):
         sys.exit("找不到基準答案: %s" % args.baseline)
@@ -96,7 +111,7 @@ def main():
             continue
 
         problems = validate(actual)
-        text = compare(baseline, actual, args.show_diffs)
+        text = compare(baseline, actual, show=show, full=args.full)
         rate = ""
         for line in text.splitlines():
             if line.startswith("逐欄正確率"):

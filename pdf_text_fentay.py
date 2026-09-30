@@ -410,8 +410,9 @@ def main():
     parser.add_argument("--out-dir", default=None,
                         help="輸出目錄，預設為專案下的 output/")
     parser.add_argument("--compare", default=None, help="基準答案 JSON 路徑")
-    parser.add_argument("--report", default=None, help="報告路徑，預設與 out 同名加 .report.txt")
-    parser.add_argument("--show-diffs", type=int, default=10)
+    parser.add_argument("--report", default=None, help="報告路徑，預設與 out 同名加時間戳")
+    parser.add_argument("--show-diffs", type=int, default=10,
+                        help="console 顯示的差異筆數，-1 代表全部（報告檔一律完整）")
     parser.add_argument("--dump-columns", action="store_true", help="輸出欄位偵測診斷")
     args = parser.parse_args()
 
@@ -474,6 +475,8 @@ def main():
 
     report.extend(["", "驗證問題 (%d):" % len(problems)])
     report.extend("  - " + p for p in problems[:20])
+    if len(problems) > 20:
+        report.append("  ... 另有 %d 個驗證問題" % (len(problems) - 20))
 
     # 獨立交叉驗證：重新從 PDF 取「金額」欄，不依賴 expected.json
     try:
@@ -504,7 +507,8 @@ def main():
             "      因此此處的高正確率屬循環比對，不能作為獨立驗證。",
             "      真正的獨立證據請看上面的 QTY x PRICE 交叉驗證。",
             "",
-            compare(expected, result, args.show_diffs),
+            # 報告檔寫入完整差異，便於事後診斷每一處錯誤
+            compare(expected, result, show=args.show_diffs, full=True),
         ])
 
     report_text = "\n".join(report)
@@ -516,9 +520,7 @@ def main():
         f.write(report_text)
 
     log("")
-    log(report_text)
-    log("")
-    log("已輸出: %s / %s" % (args.out, report_path))
+    log("完整報告: %s" % report_path)
     log("輸出目錄: %s" % out_dir)
 
 

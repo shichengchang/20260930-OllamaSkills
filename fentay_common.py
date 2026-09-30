@@ -298,8 +298,102 @@ def validate(result):
     return problems
 
 
-def compare(expected, actual, show=10):
-    """以 ORD_NO 為鍵比對兩份結果，產出逐欄正確率報告。"""
+def diff_rows(expected, actual):
+    """
+    以 ORD_NO 為鍵比對兩份結果的每個欄位。
+
+    回傳 (命中筆數, 差異清單)，差異清單元素為 (ORD_NO, 欄位, 預期值, 實際值)。
+    """
+    exp_rows = {to_text(r.get("ORD_NO")): r for r in expected.get("data", [])}
+    act_rows = {}
+    for row in actual.get("data", []):
+        act_rows[to_text(row.get("ORD_NO"))] = row
+
+    common = sorted(set(exp_rows) & set(act_rows))
+    diffs = []
+    for ord_no in common:
+        e, a = exp_rows[ord_no], act_rows[ord_no]
+        for field in FIELDS:
+            ev, av = e.get(field), a.get(field)
+            if field in ("QTY", "PRICE"):
+                digits = 2 if field == "QTY" else 3
+                same = to_number(av, digits) == to_number(ev, digits)
+            else:
+                same = to_text(ev) == to_text(av)
+            if not same:
+                diffs.append((ord_no, field, ev, av))
+    return common, diffs
+
+
+def group_diffs(diffs):
+    """
+    依欄位分組差異，並為每組統計型態。
+
+    診斷重點：多筆出現同一種型態（例如全部把 0 認成 O）通常代表單一
+    系統性錯誤，而非隨機失真。回傳 {欄位: {"型態": [(ORD_NO, 預期, 實際), ...]}}。
+    """
+    grouped = {}
+    for ord_no, field, ev, av in diffs:
+        bucket = grouped.setdefault(field, {})
+        bucket.setdefault(_diff_shape(ev, av), []).append((ord_no, ev, av))
+    return grouped
+
+
+def _diff_shape(ev, av):
+    """把一組預期/實際值轉為可比較的型態字串，用於統計重複型態。"""
+    if ev is None or av is None or ev == "" or av == "":
+        return "一方為空: 預期=%r 實際=%r" % (ev, av)
+    ev_s, av_s = to_text(ev), to_text(av)
+    if len(ev_s) == len(av_s):
+        # 等長時逐字元比對，0 與 O 這類替換會顯示為 ^ 標記
+        marks = "".join("^" if a != b else " " for a, b in zip(ev_s, av_s))
+        if marks.strip():
+            return "等長替換: %r -> %r" % (ev_s, av_s)
+    if ev_s.replace(",", "") == av_s.replace(",", ""):
+        return "千分位差異: %r -> %r" % (ev_s, av_s)
+    if "".join(ch for ch in ev_s if ch.isdigit()) == \
+            "".join(ch for ch in av_s if ch.isdigit()):
+        return "數字部分相同: %r -> %r" % (ev_s, av_s)
+    return "不同長度或內容: %r -> %r" % (ev_s, av_s)
+
+
+def format_all_diffs(diffs, group=True):
+    """輸出完整差異清單，預設依欄位分組並標註重複型態。"""
+    lines = []
+    if not diffs:
+        return ["  （無差異）"]
+
+    if not group:
+        for ord_no, field, ev, av in diffs:
+            lines.append("  %-10s %-10s 預期=%r" % (ord_no, field, ev))
+            lines.append("  %-10s %-10s 實際=%r" % ("", "", av))
+        return lines
+
+    grouped = group_diffs(diffs)
+    order = [f for f in FIELDS if f in grouped]
+    order += [f for f in grouped if f not in order]
+
+    for field in order:
+        shapes = grouped[field]
+        field_total = sum(len(v) for v in shapes.values())
+        lines.append("")
+        lines.append("--- %s (%d 處，%d 種型態) ---"
+                     % (field, field_total, len(shapes)))
+        # 型態多的先排，讓最嚴重的問題浮現
+        for shape, items in sorted(shapes.items(), key=lambda kv: -len(kv[1])):
+            lines.append("  [%d 筆] %s" % (len(items), shape))
+            for ord_no, ev, av in items:
+                lines.append("      %-10s 預期=%r  實際=%r" % (ord_no, ev, av))
+    return lines
+
+
+def compare(expected, actual, show=10, full=False, group=True):
+    """
+    以 ORD_NO 為鍵比對兩份結果，產出逐欄正確率報告。
+
+    show  控制差異明細顯示筆數（None 或負值代表全部）
+    full  True 時輸出完整差異清單（依欄位分組），供報告檔留存
+    """
     lines = []
     exp_rows = {to_text(r.get("ORD_NO")): r for r in expected.get("data", [])}
     act_rows = {}
@@ -315,24 +409,13 @@ def compare(expected, actual, show=10):
     lines.append("漏掉的 ORD_NO (%d): %s" % (len(missing), ", ".join(missing) or "無"))
     lines.append("多出的 ORD_NO (%d): %s" % (len(extra), ", ".join(extra) or "無"))
 
-    common = sorted(exp_ords & act_ords)
-    field_bad = {f: 0 for f in FIELDS}
+    common, diffs = diff_rows(expected, actual)
     total_cells = len(common) * len(FIELDS)
-    diff_samples = []
-    for ord_no in common:
-        e, a = exp_rows[ord_no], act_rows[ord_no]
-        for field in FIELDS:
-            ev, av = e.get(field), a.get(field)
-            if field in ("QTY", "PRICE"):
-                digits = 2 if field == "QTY" else 3
-                same = to_number(av, digits) == to_number(ev, digits)
-            else:
-                same = to_text(ev) == to_text(av)
-            if not same:
-                field_bad[field] += 1
-                diff_samples.append((ord_no, field, ev, av))
+    field_bad = {f: 0 for f in FIELDS}
+    for _ord_no, field, _ev, _av in diffs:
+        field_bad[field] += 1
 
-    correct = total_cells - sum(field_bad.values())
+    correct = total_cells - len(diffs)
     pct = (correct / total_cells * 100) if total_cells else 0.0
     lines.append("")
     lines.append("逐欄正確率 (僅計 ORD_NO 命中的 %d 筆 x %d 欄 = %d 格): %.1f%%"
@@ -344,11 +427,34 @@ def compare(expected, actual, show=10):
         flag = "  <-- 全錯" if common and bad == len(common) else ""
         lines.append("%-12s %8d %7.1f%%%s" % (field, bad, rate, flag))
 
-    if diff_samples:
+    if not diffs:
         lines.append("")
-        lines.append("差異明細 (前 %d 筆，共 %d 處):" % (show, len(diff_samples)))
-        for ord_no, field, ev, av in diff_samples[:show]:
-            lines.append("  %s  %-10s 預期=%r  實際=%r" % (ord_no, field, ev, av))
-        if len(diff_samples) > show:
-            lines.append("  ... 另有 %d 處" % (len(diff_samples) - show))
+        lines.append("差異明細: 無差異")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("差異總數: %d 處" % len(diffs))
+
+    if full:
+        lines.append("")
+        lines.append("=== 完整差異明細（依欄位分組，型態由多到少）===")
+        lines.extend(format_all_diffs(diffs, group=group))
+        return "\n".join(lines)
+
+    limit = len(diffs) if (show is None or show < 0) else show
+    if group:
+        lines.append("")
+        lines.append("差異型態摘要:")
+        for field, shapes in sorted(group_diffs(diffs).items(),
+                                    key=lambda kv: -sum(len(v) for v in kv[1].values())):
+            for shape, items in sorted(shapes.items(), key=lambda kv: -len(kv[1])):
+                lines.append("  %-10s [%d 筆] %s" % (field, len(items), shape))
+
+    lines.append("")
+    lines.append("差異明細 (前 %d 筆，共 %d 處):"
+                 % (min(limit, len(diffs)), len(diffs)))
+    for ord_no, field, ev, av in diffs[:limit]:
+        lines.append("  %s  %-10s 預期=%r  實際=%r" % (ord_no, field, ev, av))
+    if len(diffs) > limit:
+        lines.append("  ... 另有 %d 處（報告檔會列出完整內容）" % (len(diffs) - limit))
     return "\n".join(lines)

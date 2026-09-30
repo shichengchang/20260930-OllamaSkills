@@ -339,7 +339,8 @@ def main():
                         help="輸出目錄，預設為專案下的 output/")
     parser.add_argument("--out-base", default="result", help="輸出檔名前綴（不含時間戳）")
     parser.add_argument("--compare", default=None, help="基準答案 JSON 路徑")
-    parser.add_argument("--show-diffs", type=int, default=10)
+    parser.add_argument("--show-diffs", type=int, default=10,
+                        help="console 顯示的差異筆數，-1 代表全部（報告檔一律完整）")
     args = parser.parse_args()
 
     if not os.path.isfile(args.pdf):
@@ -423,18 +424,25 @@ def main():
                 "驗證問題 (%d):" % len(problems),
             ]
             report.extend("  - " + p for p in problems[:20])
+            if len(problems) > 20:
+                report.append("  ... 另有 %d 個驗證問題" % (len(problems) - 20))
             if expected is not None:
                 report.append("")
                 report.append("=== 與基準答案比對 ===")
-                report.append(compare(expected, result, args.show_diffs))
+                # 報告檔寫入完整差異，便於事後診斷每一處錯誤
+                report.append(compare(expected, result, show=args.show_diffs,
+                                      full=True))
 
             report_text = "\n".join(report)
             with open(report_path, "w", encoding="utf-8") as f:
                 f.write(report_text)
+            # console 顯示精簡版，報告檔才是完整內容
+            if expected is not None:
+                log("")
+                log(compare(expected, result, show=args.show_diffs))
             log("")
-            log(report_text)
-            log("")
-            log("已輸出: %s / %s" % (out_path, report_path))
+            log("已輸出: %s" % out_path)
+            log("完整報告: %s" % report_path)
 
             summary.append({
                 "model": model, "mode": mode,
