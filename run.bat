@@ -77,25 +77,23 @@ REM ------------------------------------------------------------
 :run_b_recommended
 cls
 echo [1/1] Route B: qwen3.5:4b + hybrid mode...
-echo      dpi 400 is needed to separate digit 0 from letter O in small text.
-echo      This takes about 3-4 minutes. Please wait.
+echo      This takes about 2 minutes. Please wait.
 echo.
-%PY% ollama_fentay.py --pdf "%PDF%" --skill-dir "FENTAY_B2B" --model qwen3.5:4b --mode hybrid --dpi 400 --out-base "result" --compare "expected.json"
+%PY% ollama_fentay.py --pdf "%PDF%" --skill-dir "FENTAY_B2B" --model qwen3.5:4b --mode hybrid --dpi 200 --out-base "result" --compare "expected.json"
 goto pause_menu
 
 REM ------------------------------------------------------------
 :run_b_matrix
-set /p CONFIRM="Full matrix takes about 40 minutes. Continue? (y/N): "
+set /p CONFIRM="Full matrix takes about 20 minutes. Continue? (y/N): "
 if /i not "%CONFIRM%"=="y" (
     echo Cancelled.
     goto pause_menu
 )
 cls
 echo Running 4 combinations: 2 models x 2 modes...
-echo NOTE: gemma4 uses fixed resolution, so higher dpi does not help it.
-echo This takes about 40 minutes. Please wait.
+echo This takes about 20 minutes. Please wait.
 echo.
-%PY% ollama_fentay.py --pdf "%PDF%" --skill-dir "FENTAY_B2B" --model qwen3.5:4b --model gemma4:12b --mode pure --mode hybrid --dpi 400 --out-base "result" --compare "expected.json" --show-diffs 12
+%PY% ollama_fentay.py --pdf "%PDF%" --skill-dir "FENTAY_B2B" --model qwen3.5:4b --model gemma4:12b --mode pure --mode hybrid --dpi 200 --out-base "result" --compare "expected.json" --show-diffs 12
 goto pause_menu
 
 REM ------------------------------------------------------------

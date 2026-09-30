@@ -181,7 +181,7 @@ for path in ("expected.json", "output/result.C.json"):
     ok(hits == 0, "%s 不受 OCR 修正影響（%d 筆變動）" % (path, hits))
 
 print("=== 預設 DPI ===")
-ok(m.DEFAULT_DPI == 400, "DEFAULT_DPI = 400")
+ok(m.DEFAULT_DPI == 200, "DEFAULT_DPI = 200（實測穩定最佳值）")
 
 print("=== validate ===")
 good = {"success": True, "recordCount": 1, "data": [dict(expect)]}
