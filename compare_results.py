@@ -46,7 +46,12 @@ def load(path):
 
 
 def find_results(out_dir):
-    """在輸出目錄內尋找所有結果 JSON。"""
+    """
+    在輸出目錄內尋找結果 JSON。
+
+    JSON 使用固定檔名（result.C.json、result.<model>.<mode>.json），每次執行覆蓋，
+    因此這裡只會找到最新一份。報告檔因為帶時間戳會有多份，但不參與比對。
+    """
     pattern = os.path.join(out_dir, RESULT_PATTERN)
     return sorted(p for p in glob.glob(pattern)
                   if not p.endswith(".report.txt"))

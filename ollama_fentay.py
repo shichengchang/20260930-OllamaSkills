@@ -37,7 +37,8 @@ except ImportError:
     sys.exit("缺少 PyMuPDF，請執行: pip install PyMuPDF")
 
 from fentay_common import (
-    apply_mapping, build_output, compare, log, now_iso, resolve_out_dir, validate,
+    apply_mapping, build_output, compare, log, now_iso, resolve_out_dir,
+    timestamp_slug, validate,
 )
 
 DEFAULT_HOST = "http://localhost:11434"
@@ -376,6 +377,8 @@ def main():
     for model in models:
         for mode in modes:
             started_at = now_iso()
+            # 整輪共用同一組 slug，避免同一次執行內各組合時間戳不一致
+            slug = timestamp_slug()
             call_started = time.time()
             result, stats, error = run_one(args.host, args, model, mode, images, skill_text)
             elapsed = time.time() - call_started
@@ -395,9 +398,11 @@ def main():
                 started_at=started_at,
             )
 
+            # JSON 使用固定檔名（每次覆蓋，供下游取用最新結果）
+            # 報告檔名帶時間戳，保留每次執行的紀錄
             tag = "%s.%s" % (model.replace(":", "_"), mode)
             out_path = "%s.%s.json" % (args.out_base, tag)
-            report_path = "%s.%s.report.txt" % (args.out_base, tag)
+            report_path = "%s.%s.%s.report.txt" % (args.out_base, tag, slug)
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2)
 
@@ -411,6 +416,7 @@ def main():
                 "輸入 PDF: %s (%d dpi, %d 張圖)"
                 % (os.path.basename(args.pdf), args.dpi, len(images)),
                 "輸出 JSON: %s" % out_path,
+                "  (JSON 為固定檔名，每次執行覆蓋；本報告檔名含時間戳以保留紀錄)",
                 "recordCount: %s / data 長度: %d"
                 % (result.get("recordCount"), len(result.get("data", []))),
                 "",

@@ -34,7 +34,7 @@ except ImportError:
 
 from fentay_common import (
     HEADER_ALIASES, apply_mapping, build_output, compare, log, now_iso,
-    normalize_key, resolve_out_dir, to_number, validate,
+    normalize_key, resolve_out_dir, timestamp_slug, to_number, validate,
 )
 
 # PDF 表頭的實際欄位順序，用於第 3 層備援與欄位語意判定。
@@ -420,6 +420,7 @@ def main():
 
     out_dir = resolve_out_dir(args.out_dir)
     args.out = args.out or os.path.join(out_dir, "result.C.json")
+    slug = timestamp_slug()
 
     started_at = now_iso()
     started = time.time()
@@ -457,6 +458,7 @@ def main():
         "來源: 路線 C (PDF 文字層直接解析，未使用 LLM)",
         "輸入 PDF: %s" % os.path.basename(args.pdf),
         "輸出 JSON: %s" % args.out,
+        "  (JSON 為固定檔名，每次執行覆蓋；本報告檔名含時間戳以保留紀錄)",
         "recordCount: %d / data 長度: %d" % (result["recordCount"], len(result["data"])),
         "",
         "=== 分頁診斷 ===",
@@ -506,7 +508,10 @@ def main():
         ])
 
     report_text = "\n".join(report)
-    report_path = args.report or (args.out + ".report.txt")
+    # 報告檔名帶時間戳以保留每次執行紀錄；
+    # JSON 使用固定檔名（每次覆蓋）。可用 --report 指定自訂路徑。
+    default_report = os.path.splitext(args.out)[0] + ".%s.report.txt" % slug
+    report_path = args.report or default_report
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(report_text)
 
