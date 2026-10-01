@@ -1,30 +1,42 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-test_classify_spec.py - 驗證 FENTAY_B2B_CLASSIFY 規格的可實作性。
+test_classify_spec.py - 驗證 FENTAY_B2B_CLASSIFY 規格，並比較 4 組 prompt 的準確度。
 
-目的
+實驗目的
+--------
+回答兩個問題：
+
+  1. 這份規格描述的能力，AI 實際上能做到嗎？
+  2. 餵給模型多少規格文件才夠？   <- 這是 4 組 arm 比較的目標
+
+4 組 arm（每組只增加一份文件，用來歸因每份文件的貢獻）
+------------------------------------------------------------------
+  A0 vocab   只有欄位詞彙清單 + 不匯入提示 + 輸出格式要求
+  A1 mapping 只有 MAPPING.md（別名、內容特徵、消歧規則）
+  A2 skill   SKILL.md + MAPPING.md（多了任務邊界與輸出契約）
+  A3 full    三份全讀（加上 EXAMPLES.md 的 few-shot 範例）
+
+汙染警告
+--------
+EXAMPLES.md 內含 3 個範例，而其中 3 個正是本腳本的測試案例
+（case_examples_1/2/3）。對 A3 arm 而言這等於開卷考答案，
+**不可用於 arm 比較**。每個案例都標記 contaminated，
+彙總時只以乾淨案例計算 arm 排名。
+
+Ground truth
+------------
+- 合成案例（layout_tests/）：正確答案在產生 PDF 時即確定，可靠
+- 真實 PDF（PDF/ 與豐泰.pdf）：由 infer_fields() 推導，並用
+  QTY x PRICE = PDF 金額 的交叉驗證檢查；驗證不通過者標記為可疑
+
+用法
 ----
-FENTAY_B2B_CLASSIFY 描述「AI 只判欄位語意、程式碼負責其餘」的分工。
-但該規格尚未接軌到任何程式碼，本腳本用來回答一個問題：
-
-    這份規格描述的能力，AI 實際上能做到嗎？
-
-做法
-----
-以 SKILL.md + MAPPING.md + EXAMPLES.md 三份文件的**實際內容**組出 prompt，
-餵給本地 Ollama，檢查輸出的 mapping 是否正確。
-
-測試分成三組，對應三種難度：
-  A. EXAMPLES.md 內建的 3 個範例（規格自己給的答案，屬於「有標準答案可對」）
-  B. 規格宣稱能處理、但程式碼目前做不到的情境（無表頭、欄位順序打亂、欄位數不等於 10）
-  C. 真實豐泰.pdf 的資料（與既有實驗 3 對照）
-
-若 A 組就失敗，代表規格本身有問題；
-若 A 通過而 B 失敗，代表規格的宣稱過於樂觀；
-若 A、B 都通過，代表規格可實作，且能補足程式碼的缺口。
-
-本腳本只做唯讀的 AI 呼叫與計分，不修改 FENTAY_B2B_CLASSIFY 的任何檔案。
+    python test_classify_spec.py                      # 全部案例 x 4 組 arm
+    python test_classify_spec.py --arms A0 A1         # 只跑指定 arm
+    python test_classify_spec.py --only D             # 只跑某群案例
+    python test_classify_spec.py --model gemma4:12b   # 換模型
+    python test_classify_spec.py --runs 5             # 增加重複次數
 """
 
 import argparse
@@ -43,6 +55,7 @@ import importlib.util
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SKILL_DIR = os.path.join(BASE_DIR, "FENTAY_B2B_CLASSIFY")
+PDF_DIR = os.path.join(BASE_DIR, "PDF")
 
 
 def load(name):
@@ -60,6 +73,29 @@ def read_skill_doc(name):
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
+
+# ------------------------------------------------------------ 欄位詞彙（A0）
+
+def build_vocab_prompt_text():
+    """
+    A0 的最小 prompt：只有欄位詞彙與輸出格式要求，不含任何規則。
+
+    詞彙清單由 fentay_common.HEADER_ALIASES 的鍵取得，不另外硬編一份，
+    避免與程式碼中的實際欄位集不同步。
+    """
+    fc = load("fentay_common.py")
+    names = sorted(f for f in fc.HEADER_ALIASES if f)
+    vocab = "、".join("`%s`" % n for n in names)
+    return (
+        "可用的資料庫欄位名稱：%s、null\n\n"
+        "金額、小計、合計等不匯入資料庫的欄位，填 null。\n"
+        "BRAND_NO、CUST_NO、CONTACT_NO 不出現在訂單表格中，不使用。\n\n"
+        "請依每欄的內容判斷它代表哪個欄位，無法判斷者填 null。"
+        % vocab
+    )
+
+
+# ---------------------------------------------------------------- Ollama 呼叫
 
 def call_ollama(host, model, prompt, num_predict, timeout):
     payload = {
@@ -86,21 +122,30 @@ def call_ollama(host, model, prompt, num_predict, timeout):
     }
 
 
-def build_prompt(skill_md, mapping_md, examples_md, columns, headers=None,
-                 samples=None, include_examples=True):
+# ------------------------------------------------------------- prompt 組裝
+
+def build_prompt(arm, docs, columns, headers=None, samples=None):
     """
-    以三份文件的實際內容組出 prompt。
+    依 arm 決定放入哪些規格文件。
 
-    刻意不做任何摘要或改寫：規格實際上會餵給模型的內容就是這些。
-    若為了讓測試通過而改寫文件內容，測試就失去意義。
+    docs: {"skill": str, "mapping": str, "examples": str, "vocab": str}
+    刻意不做摘要或改寫：規格實際餵給模型的內容就是文件全文。
+    若為了讓測試通過而改寫文件，測試就失去意義。
     """
-    parts = [skill_md, "", "=" * 60, "", mapping_md]
-    if include_examples:
-        parts += ["", "=" * 60, "", examples_md]
+    parts = []
+    if arm == "A0":
+        parts.append(docs["vocab"])
+    elif arm == "A1":
+        parts.append(docs["mapping"])
+    elif arm == "A2":
+        parts += [docs["skill"], "", "=" * 60, "", docs["mapping"]]
+    elif arm == "A3":
+        parts += [docs["skill"], "", "=" * 60, "", docs["mapping"],
+                  "", "=" * 60, "", docs["examples"]]
+    else:
+        sys.exit("未知的 arm: %s" % arm)
 
-    parts += ["", "=" * 60, "",
-              "以上是規格文件。以下是實際要判斷的表格。", ""]
-
+    parts += ["", "=" * 60, "", "以上是規格文件。以下是實際要判斷的表格。", ""]
     parts.append("欄位數 N = %d" % columns)
     parts.append("")
 
@@ -113,9 +158,7 @@ def build_prompt(skill_md, mapping_md, examples_md, columns, headers=None,
     if rows:
         parts.append("樣本資料:")
         for i, row in enumerate(rows):
-            cells = []
-            for k in range(columns):
-                cells.append("%d=%s" % (k, row.get(k, "")))
+            cells = ["%d=%s" % (k, row.get(k, "")) for k in range(columns)]
             parts.append("R%d: %s" % (i, " | ".join(cells)))
         parts.append("")
 
@@ -124,20 +167,43 @@ def build_prompt(skill_md, mapping_md, examples_md, columns, headers=None,
     return "\n".join(parts)
 
 
+ARMS = ["A0", "A1", "A2", "A3"]
+ARM_DESC = {
+    "A0": "僅欄位詞彙",
+    "A1": "僅 MAPPING.md",
+    "A2": "SKILL + MAPPING",
+    "A3": "三份全讀",
+}
+
+
+# ------------------------------------------------------------------ 解析計分
+
 def parse_mapping(text, n_columns):
-    """解析 AI 回應的 mapping，並檢查長度與型別。"""
+    """解析 AI 回應的 mapping。回傳 (mapping, 違規清單)。"""
+    violations = []
     try:
         obj = json.loads(text)
     except Exception:
-        return None, "JSON 解析失敗: %s" % text[:80]
+        return None, ["JSON 解析失敗"]
     if not isinstance(obj, dict) or "mapping" not in obj:
-        return None, "缺少 mapping 鍵: %s" % text[:80]
+        return None, ["缺少 mapping 鍵"]
     mapping = obj["mapping"]
     if not isinstance(mapping, list):
-        return None, "mapping 不是陣列"
+        return None, ["mapping 不是陣列"]
+
     if len(mapping) != n_columns:
-        return mapping, "長度 %d，預期 %d" % (len(mapping), n_columns)
-    return mapping, None
+        violations.append("長度 %d != %d" % (len(mapping), n_columns))
+
+    # 字串 "null" 與 JSON null 語意不同，程式端若用真值判斷會誤判
+    for i, v in enumerate(mapping):
+        if isinstance(v, str) and v.strip().lower() == "null":
+            violations.append("欄%d 使用字串 \"null\" 而非 JSON null" % i)
+
+    named = [v for v in mapping if isinstance(v, str) and v.strip().lower() != "null"]
+    dup = {x for x in named if named.count(x) > 1}
+    if dup:
+        violations.append("欄位名重複: %s" % ", ".join(sorted(dup)))
+    return mapping, violations
 
 
 def score_mapping(mapping, truth):
@@ -157,9 +223,14 @@ def score_mapping(mapping, truth):
 
 
 # ------------------------------------------------------------------ 測試案例
+#
+# 每個案例回傳的 dict 需含：
+#   name, columns, headers, rows, truth
+#   contaminated : True 表示此案例的答案出現在 EXAMPLES.md 中，
+#                  A3 arm 對它等於開卷，不可列入 arm 比較
 
 def case_examples_1():
-    """EXAMPLES.md 範例 1：無表頭，11 欄，含備註欄。"""
+    """EXAMPLES.md 範例 1：無表頭，11 欄，含備註欄。答案在 EXAMPLES.md 中。"""
     rows = [
         {0: "6AF3101", 1: "7801K", 2: '44"3AB灰網布/(3AB)', 3: '44"', 4: "碼",
          5: "500.0", 6: "22.00", 7: "11,000.00", 8: "2026/06/12", 9: "急單", 10: "LU1"},
@@ -171,11 +242,12 @@ def case_examples_1():
     truth = ["ORD_NO", "MATM_NAME", "MATM_DESC", "WIDE", "UNIT", "QTY",
              "PRICE", None, "NEED_DATE", None, "NEED_CUST"]
     return {"name": "範例1 無表頭 11 欄含備註", "columns": 11,
-            "headers": None, "rows": rows, "truth": truth}
+            "headers": None, "rows": rows, "truth": truth,
+            "contaminated": True}
 
 
 def case_examples_2():
-    """EXAMPLES.md 範例 2：無表頭，8 欄且順序打亂，缺 MATM_NAME 與 WIDE。"""
+    """EXAMPLES.md 範例 2：無表頭，8 欄且順序打亂。答案在 EXAMPLES.md 中。"""
     rows = [
         {0: "1,460.0", 1: "碼", 2: "12.50", 3: "18,250.00", 4: "6AF2001",
          5: '56"P28黑特利', 6: "2026/05/08", 7: "DS1"},
@@ -187,22 +259,29 @@ def case_examples_2():
     truth = ["QTY", "UNIT", "PRICE", None, "ORD_NO", "MATM_DESC",
              "NEED_DATE", "NEED_CUST"]
     return {"name": "範例2 無表頭 8 欄順序打亂", "columns": 8,
-            "headers": None, "rows": rows, "truth": truth}
+            "headers": None, "rows": rows, "truth": truth,
+            "contaminated": True}
+
+
+def case_examples_3():
+    """EXAMPLES.md 範例 3：英文表頭，9 欄。答案在 EXAMPLES.md 中。"""
+    rows = [
+        {0: "PO-88120", 1: "A100", 2: 'Mesh fabric 44" black', 3: '44"',
+         4: "2,000.0", 5: "YD", 6: "3.250", 7: "6,500.00", 8: "2026-07-01"},
+        {0: "PO-88121", 1: "A101", 2: 'Nylon 60" navy', 3: '60"',
+         4: "450.0", 5: "YD", 6: "7.800", 7: "3,510.00", 8: "2026-07-08"},
+    ]
+    headers = ["PO Number", "Item No", "Description", "Width", "Qty",
+               "Unit", "Unit Price", "Amount", "Delivery Date"]
+    truth = ["ORD_NO", "MATM_NAME", "MATM_DESC", "WIDE", "QTY", "UNIT",
+             "PRICE", None, "NEED_DATE"]
+    return {"name": "範例3 英文表頭 9 欄", "columns": 9,
+            "headers": headers, "rows": rows, "truth": truth,
+            "contaminated": True}
 
 
 def case_header_shuffled():
-    """
-    有表頭且欄位順序完全打亂 —— MAPPING.md 第 6~7 行明確宣稱的情境：
-    「判斷以表頭文字為第一依據…與欄位的排列順序無關」。
-
-    這是原測試設計的缺口：只測了「無表頭+打亂」與「有表頭+預設順序」
-    兩個極端，沒有測兩者的交點。少了這個案例，無法判斷規格的宣稱是否成立。
-
-    資料取自真實豐泰.pdf 第 1 頁，但欄位順序重排為
-    [子公司, 交貨日期, 金額, 單價, 數量, 規格, 料號, 單位, 訂購單號, 材料名稱]
-    —— 刻意讓 MATM_NAME 與 ORD_NO 互換位置，測試 AI 是否會被
-    「左側通常是單號」的直覺誤導（這是 MAPPING.md 自己都承認的弱證據）。
-    """
+    """有表頭且欄位順序完全打亂；MAPPING.md 明文宣稱與順序無關。乾淨案例。"""
     headers = ["子公司", "交貨日期", "金      額", "單     價", "數     量",
                "規    格", "料 號", "單位", "訂購單號", "材料名稱/顏色代碼"]
     rows = [
@@ -216,21 +295,15 @@ def case_header_shuffled():
          5: '40"', 6: "309QS", 7: "碼", 8: "6AF1103",
          9: '40"10A LJA8P網水性漿/(10A)'},
     ]
-    # 表頭在欄位 6 是「料 號」-> MATM_NAME，欄位 8 是「訂購單號」-> ORD_NO
     truth = ["NEED_CUST", "NEED_DATE", None, "PRICE", "QTY", "WIDE",
              "MATM_NAME", "UNIT", "ORD_NO", "MATM_DESC"]
     return {"name": "有表頭 10 欄順序完全打亂", "columns": 10,
-            "headers": headers, "rows": rows, "truth": truth}
+            "headers": headers, "rows": rows, "truth": truth,
+            "contaminated": False}
 
 
 def case_header_shuffled_swapped():
-    """
-    同上有表頭打亂，但額外讓 MATM_NAME 與 ORD_NO 互換位置。
-
-    兩者都是短英數代碼、幾乎不重複、長度相近，是 MAPPING.md
-    第 63~73 行承認的「無法可靠區分」組合。此案例檢查 AI 是否
-    會被位置直覺誤導，以及在無法區分時是否誠實地填 null。
-    """
+    """有表頭，料號延後至第 5 欄。測試 AI 是否被位置直覺誤導。乾淨案例。"""
     headers = ["訂購單號", "材料名稱/顏色代碼", "單     價", "單位", "規格",
                "料 號", "交貨日期", "數     量", "金      額", "子公司"]
     rows = [
@@ -244,210 +317,338 @@ def case_header_shuffled_swapped():
          4: '40"', 5: "309QS", 6: "2026/04/10", 7: "2.0",
          8: "208.00", 9: "DS1"},
     ]
-    # 訂購單號刻意放在第 0 欄、料號放在第 5 欄，與常見「料號在前」相反。
-    # 表頭文字明確，因此正確答案應完全依表頭判斷。
     truth = ["ORD_NO", "MATM_DESC", "PRICE", "UNIT", "WIDE",
              "MATM_NAME", "NEED_DATE", "QTY", None, "NEED_CUST"]
     return {"name": "有表頭 料號延後至第5欄", "columns": 10,
-            "headers": headers, "rows": rows, "truth": truth}
-
-
-def case_examples_3():
-    """EXAMPLES.md 範例 3：英文表頭，9 欄。"""
-    rows = [
-        {0: "PO-88120", 1: "A100", 2: 'Mesh fabric 44" black', 3: '44"',
-         4: "2,000.0", 5: "YD", 6: "3.250", 7: "6,500.00", 8: "2026-07-01"},
-        {0: "PO-88121", 1: "A101", 2: 'Nylon 60" navy', 3: '60"',
-         4: "450.0", 5: "YD", 6: "7.800", 7: "3,510.00", 8: "2026-07-08"},
-    ]
-    headers = ["PO Number", "Item No", "Description", "Width", "Qty",
-               "Unit", "Unit Price", "Amount", "Delivery Date"]
-    truth = ["ORD_NO", "MATM_NAME", "MATM_DESC", "WIDE", "QTY", "UNIT",
-             "PRICE", None, "NEED_DATE"]
-    return {"name": "範例3 英文表頭 9 欄", "columns": 9,
-            "headers": headers, "rows": rows, "truth": truth}
+            "headers": headers, "rows": rows, "truth": truth,
+            "contaminated": False}
 
 
 def case_hard_no_header():
     """
-    規格宣稱能處理、但 pdf_text_fentay.infer_fields() 目前做不到的情境。
-
-    12 欄、無表頭、順序完全打亂、欄位數不等於 10，
-    且刻意讓 QTY 與 PRICE 的數值大小相反（數量小、單價高），
-    檢查 MAPPING.md 所述的消歧規則是否真的有效。
-
-    兩個額外欄位都填 null（備註、小計），因為規格規定同一欄位名
-    最多出現一次，重複欄位本身就有歧義，不適合當測試題。
+    無表頭且 12 欄完全打亂，含兩個不匯入欄。
+    刻意讓 QTY 小、PRICE 高，測試 MAPPING.md 的消歧規則是否有效。乾淨案例。
     """
     rows = [
-        {0: "9800", 1: "154.00", 2: "PC", 3: "6AF9901", 4: "38\"9K白網布/(9K)",
-         5: "125.0", 6: "2026/08/01", 7: '38"', 8: "DS2", 9: "急單", 10: "38\"", 11: "45,900.00"},
+        {0: "9800", 1: "154.00", 2: "PC", 3: "6AF9901", 4: '38"9K白網布/(9K)',
+         5: "125.0", 6: "2026/08/01", 7: '38"', 8: "DS2", 9: "急單",
+         10: '38"', 11: "45,900.00"},
         {0: "9801", 1: "784.00", 2: "PC", 3: "6AF9902", 4: '52"3BK灰網/(3BK)',
-         5: "80.0", 6: "2026/08/08", 7: '52"', 8: "DS1", 9: "", 10: '52"', 11: "62,720.00"},
+         5: "80.0", 6: "2026/08/08", 7: '52"', 8: "DS1", 9: "",
+         10: '52"', 11: "62,720.00"},
         {0: "9802", 1: "104.00", 2: "PC", 3: "6AF9903", 4: '60"12B黑PE網/(12B)',
-         5: "2.0", 6: "2026/08/15", 7: '60"', 8: "DS1", 9: "", 10: '60"', 11: "208.00"},
+         5: "2.0", 6: "2026/08/15", 7: '60"', 8: "DS1", 9: "",
+         10: '60"', 11: "208.00"},
     ]
     truth = ["MATM_NAME", "PRICE", "UNIT", "ORD_NO", "MATM_DESC",
-             "QTY", "NEED_DATE", "WIDE", "NEED_CUST", None, "WIDE_2", None]
-    # WIDE 不應重複出現，第二個 38"/52"/60" 欄是同寬度的重複欄位，
-    # 規格要求欄位名不重複，因此該欄應填 null 而非 WIDE
-    truth[10] = None
+             "QTY", "NEED_DATE", "WIDE", "NEED_CUST", None, None, None]
     return {"name": "難題 無表頭 12 欄全打亂", "columns": 12,
-            "headers": None, "rows": rows, "truth": truth}
+            "headers": None, "rows": rows, "truth": truth,
+            "contaminated": False}
 
 
 def case_real_pdf():
-    """真實豐泰.pdf 第 1 頁的資料，與既有實驗 3 對照。"""
+    """原始豐泰.pdf 第 1 頁，作為基準對照（不含表頭）。"""
+    return _pdf_case(os.path.join(BASE_DIR, "豐泰.pdf"), "豐泰.pdf",
+                     False, with_headers=False)
+
+
+def case_real_pdf_headers():
+    """原始豐泰.pdf，額外提供各欄表頭。"""
+    return _pdf_case(os.path.join(BASE_DIR, "豐泰.pdf"), "豐泰.pdf",
+                     False, with_headers=True)
+
+
+def _extract_column_headers(spans, top, lefts, y_window=25, tol=None):
+    """
+    依欄位左界取出各欄的表頭文字。
+
+    y_window 限制在資料區上界前若干 pt 之內，用來排除頁首抬頭
+    （供應商、地址、列印編號）。不設限會把 '致  供應商:' 當成
+    第一欄的表頭。
+
+    已知限制：本 PDF 的「訂購單號」與「料 號」被排在同一個 span（x=21），
+    因此 x=66 那一欄取不到自己的表頭，會錯抓右側欄位的表頭。
+    這是 PDF 層資訊遺失，非本函式的判斷錯誤，故不做修補而如實回傳，
+    由測試結果反映其影響。
+    """
+    if tol is None:
+        pt = load("pdf_text_fentay.py")
+        tol = pt.HEADER_X_TOLERANCE
+    ymin = top - y_window
+    out = []
+    for left in lefts:
+        best = None
+        for y, x, t in spans:
+            if y < ymin or y >= top or is_rule_text(t):
+                continue
+            d = abs(x - left)
+            if d < tol and (best is None or d < best[0]):
+                best = (d, t)
+        out.append(best[1] if best else None)
+    return out
+
+
+def is_rule_text(text):
+    """與 pdf_text_fentay.is_rule 相同，但避免重複載入模組。"""
+    s = text.strip()
+    return len(s) >= 4 and set(s) == {"-"}
+
+
+def _pdf_case(path, label, contaminated, with_headers=False):
+    """
+    由真實 PDF 抽出樣本列與欄位對應。
+
+    ground truth 來自 infer_fields()，並以 QTY x PRICE = PDF 金額
+    的獨立交叉驗證檢查。若驗證不通過，代表基準本身可疑，會在結果中標記。
+
+    with_headers: 是否一併提供各欄表頭文字給模型。
+    """
     pt = load("pdf_text_fentay.py")
     try:
         import fitz
     except ImportError:
         sys.exit("缺少 PyMuPDF")
-    pdfs = glob.glob(os.path.join(BASE_DIR, "*.pdf"))
-    if not pdfs:
-        sys.exit("找不到 PDF")
-    doc = fitz.open(pdfs[0])
+
+    doc = fitz.open(path)
     spans = pt.collect_spans(doc[0])
     doc.close()
 
     top, bottom, _ = pt.find_table_bounds(spans)
+    if top is None:
+        return None
     lefts, source = pt.detect_columns(spans, top, bottom, False)
     truth = pt.infer_fields(lefts, spans, top, len(lefts))
     rows = pt.cluster_rows(spans, top, bottom)
 
     samples = []
-    for cells in rows[:3]:
+    for cells in rows:
         raw = {}
         for x, t in cells:
             raw.setdefault(pt.column_index(lefts, x), []).append(t)
-        samples.append({k: "".join(v) for k, v in sorted(raw.items())})
+        merged = {k: "".join(v) for k, v in sorted(raw.items())}
+        if 0 in merged:
+            samples.append(merged)
 
-    return {"name": "真實豐泰.pdf 第1頁", "columns": len(lefts),
-            "headers": None, "rows": samples, "truth": truth,
-            "detect_source": source}
+    # 獨立交叉驗證：欄位若錯位，QTY 與 PRICE 會對到不同資料列
+    recs, _diag = pt.extract(path)
+    amts = pt.collect_amounts(path)
+    verified, mismatches = pt.cross_validate(recs, amts)
+    trustworthy = (not mismatches) and verified == len(recs)
+
+    headers = None
+    if with_headers:
+        headers = _extract_column_headers(spans, top, lefts)
+
+    name = label if not with_headers else "%s +表頭" % label
+    return {"name": "%s (%d 列)" % (name, len(samples)),
+            "columns": len(lefts), "headers": headers,
+            "rows": samples[:12], "truth": truth,
+            "contaminated": contaminated,
+            "detect_source": source,
+            "cross_verified": "%d/%d" % (verified, len(recs)),
+            "trustworthy": trustworthy,
+            "total_rows": len(samples)}
+
+
+def pdf_cases(with_headers=False, limit=None):
+    """PDF/ 目錄下的測試檔案。"""
+    if not os.path.isdir(PDF_DIR):
+        return []
+    out = []
+    for path in sorted(glob.glob(os.path.join(PDF_DIR, "*.pdf"))):
+        label = os.path.basename(path)
+        case = _pdf_case(path, label, False, with_headers=with_headers)
+        if case:
+            out.append(case)
+        if limit and len(out) >= limit:
+            break
+    return out
 
 
 GROUPS = [
-    ("A 規格自帶範例（應完全正確）",
-     [case_examples_1, case_examples_2, case_examples_3]),
-    ("B 有表頭且順序打亂（規格明文宣稱與順序無關）",
-     [case_header_shuffled, case_header_shuffled_swapped]),
-    ("C 無表頭且順序打亂（程式碼做不到的情境）",
-     [case_hard_no_header]),
-    ("D 真實 PDF 對照",
-     [case_real_pdf]),
+    ("A 規格自帶範例【汙染，不列入 arm 比較】",
+     [case_examples_1, case_examples_2, case_examples_3], False, None),
+    ("B 有表頭且順序打亂",
+     [case_header_shuffled, case_header_shuffled_swapped], False, None),
+    ("C 無表頭且順序打亂",
+     [case_hard_no_header], False, None),
+    ("D 真實 PDF（無表頭）",
+     [case_real_pdf, case_real_pdf_headers], True, None),
+    ("E 新增測試 PDF（無表頭）",
+     None, True, ("content", None)),
+    ("F 新增測試 PDF（有表頭）",
+     None, True, ("headers", 3)),
 ]
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="驗證 FENTAY_B2B_CLASSIFY 規格的可實作性")
+        description="FENTAY_B2B_CLASSIFY 規格可實作性 + 4 組 prompt arm 比較")
     parser.add_argument("--model", default="qwen3.5:4b")
     parser.add_argument("--host", default="http://localhost:11434")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=900)
-    parser.add_argument("--no-examples", action="store_true",
-                        help="prompt 不含 EXAMPLES.md，用來量測其貢獻")
+    parser.add_argument("--arms", nargs="+", default=ARMS,
+                        help="要比較的 arm，例如 --arms A0 A1")
     parser.add_argument("--only", default=None,
-                        help="只跑指定群組，例如 A / B / C")
+                        help="只跑指定群組，例如 A / B / C / D / E")
+    parser.add_argument("--samples", type=int, default=3,
+                        help="給模型看幾列樣本")
     parser.add_argument("--dump-prompt", action="store_true")
     args = parser.parse_args()
 
-    skill_md = read_skill_doc("SKILL.md")
-    mapping_md = read_skill_doc("MAPPING.md")
-    examples_md = read_skill_doc("EXAMPLES.md")
+    docs = {
+        "skill": read_skill_doc("SKILL.md"),
+        "mapping": read_skill_doc("MAPPING.md"),
+        "examples": read_skill_doc("EXAMPLES.md"),
+        "vocab": build_vocab_prompt_text(),
+    }
 
-    print("=" * 68)
-    print("FENTAY_B2B_CLASSIFY 規格可實作性測試")
-    print("模型: %s   每案例執行 %d 次" % (args.model, args.runs))
-    print("prompt 組成: SKILL.md + MAPPING.md + %s"
-          % ("(不含 EXAMPLES.md)" if args.no_examples else "EXAMPLES.md"))
-    print("=" * 68)
+    print("=" * 72)
+    print("FENTAY_B2B_CLASSIFY 規格可實作性 + arm 比較")
+    print("模型: %s   每案例 %d 次   樣本列數: %d" % (args.model, args.runs, args.samples))
+    print("要比較的 arm: %s" % ", ".join("%s(%s)" % (a, ARM_DESC[a]) for a in args.arms))
+    print("=" * 72)
 
     results = []
-    for group_name, builders in GROUPS:
+    for group_name, builders, _flag, param in GROUPS:
         if args.only and not group_name.startswith(args.only):
             continue
+        if builders is None:
+            mode, limit = param
+            cases = pdf_cases(with_headers=(mode == "headers"), limit=limit)
+            if not cases:
+                print("")
+                print("### %s" % group_name)
+                print("  （找不到 PDF/ 目錄或其中無可用檔案，略過）")
+                continue
+        else:
+            cases = []
+            for b in builders:
+                c = b()
+                if c:
+                    cases.append(c)
+
         print("")
         print("### %s" % group_name)
-        for builder in builders:
-            case = builder()
-            truth = case["truth"]
+        for case in cases:
             n = case["columns"]
+            rows = case["rows"][:args.samples]
+            flag = "【汙染】" if case["contaminated"] else ""
+            extra = ""
+            if "cross_verified" in case:
+                extra = "  交叉驗證 %s%s" % (
+                    case["cross_verified"],
+                    "" if case.get("trustworthy") else "  <== 基準可疑")
 
-            prompt = build_prompt(
-                skill_md, mapping_md, examples_md, n,
-                headers=case["headers"], samples=case["rows"],
-                include_examples=not args.no_examples)
-            if args.dump_prompt:
-                print("-" * 60)
-                print(prompt)
-                print("-" * 60)
+            per_arm = {}
+            for arm in args.arms:
+                prompt = build_prompt(arm, docs, n,
+                                      headers=case["headers"], samples=rows)
+                if args.dump_prompt and arm == args.arms[0]:
+                    print("-" * 60)
+                    print(prompt)
+                    print("-" * 60)
 
-            scores = []
-            times = []
-            ptoks = []
-            outputs = []
-            problems = []
-            for _ in range(args.runs):
-                resp = call_ollama(args.host, args.model, prompt, 700, args.timeout)
-                times.append(resp["elapsed"])
-                ptoks.append(resp["prompt_tokens"] or 0)
-                mapping, problem = parse_mapping(resp["text"], n)
-                if problem:
-                    problems.append(problem)
-                score, wrong = score_mapping(mapping, truth)
-                scores.append(score)
-                outputs.append((mapping, wrong))
+                scores, times, ptoks, outs, viols = [], [], [], [], []
+                for _ in range(args.runs):
+                    resp = call_ollama(args.host, args.model, prompt, 700, args.timeout)
+                    times.append(resp["elapsed"])
+                    ptoks.append(resp["prompt_tokens"] or 0)
+                    mapping, v = parse_mapping(resp["text"], n)
+                    score, wrong = score_mapping(mapping, case["truth"])
+                    scores.append(score)
+                    outs.append(mapping)
+                    viols.append(v)
+                per_arm[arm] = {
+                    "score": sum(scores) / len(scores),
+                    "exact": all(s == 1.0 for s in scores),
+                    "elapsed": sum(times) / len(times),
+                    "tokens": int(sum(ptoks) / len(ptoks)),
+                    "got": outs[0],
+                    "wrong": score_mapping(outs[0], case["truth"])[1],
+                    "violations": viols[0],
+                    "consistent": len({json.dumps(o, ensure_ascii=False) for o in outs}) == 1,
+                }
 
-            avg = sum(scores) / len(scores)
-            same = len({json.dumps(m[0], ensure_ascii=False)
-                        for m, _ in outputs}) == 1
-            tag = "OK  " if avg == 1.0 else "FAIL"
             print("")
-            print("  [%s] %s" % (tag, case["name"]))
-            print("        欄位數=%d 得分=%.3f  %d 次一致=%s  平均 %.1fs  prompt %d tok"
-                  % (n, avg, args.runs, "是" if same else "否",
-                     sum(times) / len(times), int(sum(ptoks) / len(ptoks))))
-            mapping, wrong = outputs[0]
-            if wrong:
-                print("        期望: %s" % truth)
-                print("        實際: %s" % mapping)
-                for i, a, e in wrong:
-                    print("          欄%-2d 得 %-12s 應 %s" % (i, a, e))
-            if problems:
-                print("        格式問題: %s" % problems[0])
+            print("  %s %s%s" % (case["name"], flag, extra))
+            print("        欄位數=%d  期望: %s" % (n, case["truth"]))
+            for arm in args.arms:
+                r = per_arm[arm]
+                tag = "OK  " if r["exact"] else "FAIL"
+                line = "        [%s] %s 完全正確=%-5s 欄位=%.3f %s %.1fs %4d tok" % (
+                    tag, arm, r["exact"], r["score"],
+                    "一致" if r["consistent"] else "不一致",
+                    r["elapsed"], r["tokens"])
+                print(line)
+                if r["wrong"]:
+                    for i, a, e in r["wrong"]:
+                        print("                欄%-2d 得 %-12s 應 %s" % (i, a, e))
+                if r["violations"]:
+                    print("                格式違規: %s" % "; ".join(r["violations"]))
 
             results.append({
                 "group": group_name, "name": case["name"],
-                "columns": n, "score": avg,
-                "consistent": same, "elapsed": sum(times) / len(times),
-                "prompt_tokens": int(sum(ptoks) / len(ptoks)),
-                "truth": truth,
-                "got": outputs[0][0],
-                "wrong": outputs[0][1],
+                "columns": n, "contaminated": case["contaminated"],
+                "trustworthy": case.get("trustworthy"),
+                "cross_verified": case.get("cross_verified"),
+                "truth": case["truth"],
+                "arms": {a: per_arm[a] for a in args.arms},
             })
 
+    # ------------------------------------------------------------ 彙總
     print("")
-    print("=" * 68)
-    print("彙總")
-    print("=" * 68)
-    print("%-34s %6s %8s %6s" % ("案例", "得分", "耗時s", "一致"))
-    for r in results:
-        print("%-34s %6.3f %8.1f %6s"
-              % (r["name"], r["score"], r["elapsed"],
-                 "是" if r["consistent"] else "否"))
-    perfect = sum(1 for r in results if r["score"] == 1.0)
-    print("")
-    print("完全正確: %d / %d" % (perfect, len(results)))
-    print("（未達 1.000 的案例已在上方列出錯誤欄位）")
+    print("=" * 72)
+    print("arm 比較彙總")
+    print("=" * 72)
+    clean = [r for r in results if not r["contaminated"]]
+    dirty = [r for r in results if r["contaminated"]]
+    suspicious = [r for r in clean if r["trustworthy"] is False]
 
-    out_path = os.path.join(BASE_DIR, "output", "classify_spec_results.json")
+    def arm_stats(rows):
+        out = {}
+        for arm in args.arms:
+            if not rows:
+                continue
+            exact = sum(1 for r in rows if r["arms"][arm]["exact"])
+            field = sum(r["arms"][arm]["score"] for r in rows) / len(rows)
+            toks = sum(r["arms"][arm]["tokens"] for r in rows) / len(rows)
+            secs = sum(r["arms"][arm]["elapsed"] for r in rows) / len(rows)
+            bad = sum(1 for r in rows if r["arms"][arm]["violations"])
+            out[arm] = (exact, field, toks, secs, bad)
+        return out
+
+    print("")
+    print("【乾淨案例】%d 個（可列入 arm 比較）" % len(clean))
+    print("  %-5s %-10s %-10s %-9s %-8s %-8s"
+          % ("arm", "完全正確", "欄位準確率", "prompt tok", "耗時s", "格式違規"))
+    for arm, (exact, field, toks, secs, bad) in arm_stats(clean).items():
+        print("  %-5s %-10s %-10.3f %-9.0f %-8.1f %d/%d"
+              % (arm, "%d/%d" % (exact, len(clean)), field, toks, secs, bad, len(clean)))
+
+    if dirty:
+        print("")
+        print("【汙染案例】%d 個（答案在 EXAMPLES.md 中，僅供參考，不列入比較）" % len(dirty))
+        print("  %-5s %-10s %-10s" % ("arm", "完全正確", "欄位準確率"))
+        for arm, (exact, field, toks, secs, bad) in arm_stats(dirty).items():
+            print("  %-5s %-10s %-10.3f"
+                  % (arm, "%d/%d" % (exact, len(dirty)), field))
+
+    if suspicious:
+        print("")
+        print("【基準可疑】以下 PDF 的交叉驗證不通過，ground truth 可能本身有誤：")
+        for r in suspicious:
+            print("  - %s（交叉驗證 %s）" % (r["name"], r["cross_verified"]))
+
+    out_path = os.path.join(BASE_DIR, "output", "classify_arm_results.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump({"model": args.model, "runs": args.runs,
-                   "include_examples": not args.no_examples,
-                   "results": results}, f, ensure_ascii=False, indent=2)
+                   "arms": args.arms, "samples": args.samples,
+                   "results": results}, f, ensure_ascii=False, indent=2, default=str)
+    print("")
     print("結果已寫入: %s" % out_path)
 
 
