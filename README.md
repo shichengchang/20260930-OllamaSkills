@@ -2,7 +2,31 @@
 
 將豐泰（FENTAY）訂購單 PDF 轉換為 `FENTAY_B2B` 資料表格式的 JSON。
 
-本專案實作兩條解析路線並提供量化比對，用來評估「要不要用 LLM 來做這件事」。
+本專案實作多條解析路線並提供量化比對，用來評估「要不要用 LLM 來做這件事」。
+
+---
+
+## 文件分組
+
+LLM 在這個專案有兩種**性質完全不同**的用法，兩者不可混為一談：
+
+| | 第一組：LLM 生成完整資料 | 第二組：LLM 只判斷欄位 |
+| --- | --- | --- |
+| LLM 的任務 | 讀圖 → 逐字輸出所有資料值 | 只回答「這一欄是什麼」 |
+| LLM 是否碰資料值 | **是**，必須逐字轉錄 | **否**，只讀樣本判斷語意 |
+| 產出 | 完整 JSON（38 筆） | mapping 陣列（10 個欄位名） |
+| 規格 | `FENTAY_B2B/` | `FENTAY_B2B_CLASSIFY/` |
+| 程式 | `ollama_fentay.py`、`pdf_text_fentay.py` | `test_classify_spec.py` |
+| 說明文件 | **本檔案**（[往下看](#快速開始)） | **[README_CLASSIFY.md](README_CLASSIFY.md)** |
+
+**怎麼選：**
+
+- 想了解「整份資料交給 LLM 做」的完整評估 → 看本檔案
+- 想了解「只讓 LLM 判斷欄位語意」的規格與實測 → 看
+  [README_CLASSIFY.md](README_CLASSIFY.md)
+
+第一組的結論已定案（純 LLM 不划算），第二組的規格仍**未接軌到生產流程**，
+兩者的成熟度不同。
 
 ---
 
@@ -15,7 +39,7 @@
 或直接執行：
 
 ```powershell
-python test_fentay.py                                                       # 單元測試（110 項）
+python test_fentay.py                                                       # 單元測試
 python pdf_text_fentay.py --pdf ".\豐泰.pdf" --compare ".\expected.json"   # 路線 C
 ```
 
@@ -28,16 +52,20 @@ fentay_common.py       規則的唯一實作（MAPPING.md 轉換規則 + 輸出�
 ├── ollama_fentay.py   路線 B：PDF → PNG → vision 模型 → JSON
 └── pdf_text_fentay.py 路線 C：PDF 文字層 → 座標分組 → JSON
 
-test_fentay.py         110 項單元測試
+test_fentay.py         單元測試
 compare_results.py     批次比較所有 result.*.json
 ai_locate_experiment.py 實驗：AI 能否取代程式碼做版面定位
 check_env.py           環境檢查
 expected.json          38 筆基準答案
 run.bat                功能選單（雙擊執行）
-FENTAY_B2B/            Skill 規格（SKILL.md / MAPPING.md / EXAMPLES.md）
+make_layout_pdfs.py    產生欄位順序可控的測試 PDF
+
+FENTAY_B2B/            第一組規格：LLM 生成完整資料
+FENTAY_B2B_CLASSIFY/   第二組規格：LLM 只判斷欄位
+README_CLASSIFY.md     第二組的說明與實測結果
 ```
 
-`fentay_common.py` 是關鍵設計：轉換規則只有一份實作，兩條路線共用，
+`fentay_common.py` 是關鍵設計：轉換規則只有一份實作，各路線共用，
 因此比對結果才具有可比性。它只依賴 Python 標準函式庫，不需要 `fitz` 或 `requests`。
 
 ---
@@ -469,6 +497,9 @@ python pdf_text_fentay.py --pdf ".\豐泰.pdf" --dump-columns
 >
 > 本章的價值在於**量測 AI 能力**（「決策可靠、座標不可靠」），
 > **不是**提出生產方案。請勿把下文的 100% 誤解為「建議改用 AI」。
+>
+> 若你只想看「LLM 只判斷欄位」這第二組用法及其規格，請看
+> [README_CLASSIFY.md](README_CLASSIFY.md)。
 
 ### 實驗 3：給內容，判斷語意（AI 唯一做對的部分）
 
@@ -498,6 +529,33 @@ AI 回傳：
 | 平均耗時 | 4.0 秒 |
 | prompt tokens | 574 |
 | 輸出 tokens | 61 |
+
+### 樣本數要給幾列？實測結果是 1 列就夠
+
+這個問題值得單獨驗證，因為「多給樣本應該更準」是直覺上合理的假設。
+實測結果（`qwen3.5:4b`，每組 3 次）：
+
+| 樣本數 | 得分 | 3 次一致 | 耗時 | prompt tokens |
+| ------ | ---- | -------- | ---- | ------------- |
+| 1 列 | **1.00** | 是 | 4.9s | 361 |
+| 2 列 | **1.00** | 是 | 3.9s | 464 |
+| 3 列（本實驗使用） | **1.00** | 是 | 3.9s | 566 |
+| 5 列 | **1.00** | 是 | 4.0s | 780 |
+| 10 列 | **1.00** | 是 | 4.1s | 1310 |
+| 全部 21 列 | **1.00** | 是 | 4.4s | 2505 |
+
+**1 列就夠了，全部 21 列不會更好。**
+
+原因不是模型聰明，而是這張表的每欄內容**自我說明** ——
+`6AF1101` 一看就是單號、`碼` 就是單位、`2026/03/27` 就是日期。
+給多少列都是在問同一個已經寫在資料裡的答案。
+
+耗時幾乎不變（3.9–4.9 秒），因為瓶頸是模型載入與思考，不是 prompt 長度。
+給全部 21 列只是多燒 2144 tokens 換零收益。
+
+因此**這個實驗的樣本數對「結果正確率」毫無鑑別度**，
+3 列並非某種刻意選擇，只是無差別。
+這也表示：此實驗無法用來論證「給 AI 多少樣本才夠」這個一般性問題。
 
 ### 但這 100% 不能與 Route B 的 99.8% 相提並論
 
@@ -832,7 +890,7 @@ output/
 | ---- | ---- |
 | Python | 3.10+ |
 | 套件 | `PyMuPDF`、`requests` |
-| Ollama | 僅路線 B 需要 |
+| Ollama | 路線 B 與 CLASSIFY 測試需要 |
 | 模型 | `qwen3.5:4b`（建議）、`gemma4:12b` |
 
 ```powershell
@@ -840,6 +898,9 @@ pip install PyMuPDF requests
 ```
 
 不使用 `ollama` Python 套件，直接以 HTTP 呼叫 API。
+
+`test_classify_spec.py` 需要 `FENTAY_B2B_CLASSIFY/` 目錄與本地 Ollama；
+`make_layout_pdfs.py` 只需 `PyMuPDF`（用內建 CJK 字型，不需額外套件）。
 
 ---
 
@@ -862,6 +923,25 @@ pip install PyMuPDF requests
    不應把單次執行結果當成模型的穩定能力指標。
 6. **提高 DPI 有風險。** 300 DPI 以上在 31.5 GB RAM 的機器上曾導致
    Ollama 行程崩潰（記憶體耗盡），詳見「關於 DPI」章節。
+7. **`FENTAY_B2B_CLASSIFY/` 尚未接軌。** 這是第二組用法（LLM 只判斷欄位），
+   目前沒有任何程式碼引用該目錄，`test_classify_spec.py` 僅作測試用途。
+   實測結果與已知缺陷見 [README_CLASSIFY.md](README_CLASSIFY.md)。
+
+---
+
+## 兩種 LLM 用法的成熟度
+
+| | 第一組（本文件） | 第二組 |
+| - | ---------------- | ------ |
+| 用法 | LLM 生成完整資料 | LLM 只判斷欄位 |
+| 規格 | `FENTAY_B2B/` | `FENTAY_B2B_CLASSIFY/` |
+| 程式 | `ollama_fentay.py`、`pdf_text_fentay.py` | 尚未接軌 |
+| 實測 | 已完成，結論明確 | 已完成可實作性測試，結論待決 |
+| 結論 | **不建議用 LLM 生成完整資料** | 有價值但需先加輸出驗證 |
+
+第二組的價值在無表頭情境（AI 0.500~0.875 vs 程式碼幾乎全錯），
+但有表頭時 AI 與程式碼同為 1.000，且 AI 慢 200 倍。
+詳見 [README_CLASSIFY.md](README_CLASSIFY.md)。
 
 ---
 
