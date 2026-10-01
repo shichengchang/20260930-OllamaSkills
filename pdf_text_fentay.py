@@ -64,17 +64,60 @@ def collect_spans(page):
 
 
 def is_rule(text):
-    """判斷是否為表頭虛線（僅含 '-' 且長度 >= 4）。"""
-    return len(text) >= 4 and set(text) == {"-"}
+    """
+    判斷是否為表頭虛線（僅含 '-' 與空白，且 '-' 數量 >= 4）。
+
+    容忍尾端空白：產生測試 PDF 時欄距不足會讓相鄰虛線被併入同一個
+    span 且帶有空白字元，若不容忍空白會誤判為非虛線。
+    """
+    stripped = text.strip()
+    return len(stripped) >= 4 and set(stripped) == {"-"}
+
+
+def _guess_data_top_by_repetition(spans):
+    """
+    備援：當無法用絕對 x 門檻找到首欄時，改用「最左資料欄」定位資料列。
+
+    處理的是**版面位移**（整張表往右挪動），不是單號格式改變。
+    判斷依據是資料列的縱向重複性：同一 x 位置出現多列等距文字，
+    且該欄不是表頭文字（表頭只有一列）。
+
+    只看「最左欄」不足以分辨表頭與資料，因此要求該 x 至少出現 3 列；
+    這一條同時排除了抬頭（供應商、地址，通常 1~2 筆）。
+    """
+    body = [(y, x, t) for y, x, t in spans if not is_rule(t) and t.strip()]
+    if not body:
+        return None
+
+    counts = {}
+    for y, x, _t in body:
+        counts.setdefault(x, []).append(y)
+    repeated = [ys for ys in counts.values() if len(ys) >= 3]
+    if not repeated:
+        return None
+
+    # 資料區起點 = 重複欄位中最早的 y。
+    # 表頭文字雖在最上方，但只出現一列，已被 >= 3 的條件排除。
+    return min(min(ys) for ys in repeated)
 
 
 def find_table_bounds(spans):
-    """定位資料區上界（第一筆訂購單號）與下界（頁尾長虛線分隔線）。"""
-    starts = [y for y, x, t in spans if x < 30 and t[:1].isdigit() and t[:1] == "6"]
+    """
+    定位資料區上界（第一筆資料列）與下界（頁尾長虛線分隔線）。
+
+    優先以「第一欄內容開頭為 6」定位（此格式由 FENTAY_B2B 文件定義）。
+    失敗時改以最左資料欄的縱向重複性定位，避免使用絕對 x 門檻
+    （如 x < 30）—— 該門檻會讓整張表右移後完全找不到資料區。
+    """
+    # 單號格式（開頭為 6）由 FENTAY_B2B 文件定義，但不綁定 x 座標，
+    # 否則整張表右移就會漏判。
+    starts = [y for y, x, t in spans if t[:1].isdigit() and t[:1] == "6"]
     if not starts:
-        starts = [y for y, x, t in spans if x < 30 and len(t) >= 5]
-    if not starts:
-        return None, None, None
+        top = _guess_data_top_by_repetition(spans)
+        if top is None:
+            return None, None, None
+        starts = [top]
+
     top = min(starts)
     seps = [y for y, x, t in spans if y > top and is_rule(t) and len(t) > 50]
     bottom = min(seps) - 3 if seps else max(y for y, _, _ in spans)
@@ -166,12 +209,20 @@ def header_field_candidates(text):
 def infer_fields(lefts, header_spans, top, n_columns):
     """
     決定每個欄位對應的資料庫欄位名。
-    以表頭文字比對為主（符合 MAPPING.md「以標題文字比對為主，與欄位順序無關」）；
-    若表頭文字不足，才退回已知欄位順序補齊。
+    以表頭文字比對為主；若表頭文字不足，才退回已知欄位順序補齊。
 
     合併 span 的處理：本 PDF 的「訂購單號」與「料號」被排在同一個 span（x=21），
     該 span 對應欄位 0，但含有 ORD_NO 與 MATM_NAME 兩個別名。距離最近者優先佔用
     欄位 0，落選的別名則依序填入其右側相鄰的未配對欄位（此處為欄位 1）。
+
+    已知限制（實測，見 make_layout_pdfs.py 產生的版式測試檔）：
+      - 整張版面左右位移可正確處理（欄位 x 改變不影響）。
+      - 欄位順序改變**無法可靠處理**。PDF 引擎會把相鄰欄位的表頭
+        合併成同一個 span（實測產生 '子公司  單     價'、
+        '交貨日期  訂購單號'），此時無法從 span 還原哪個別名屬於哪一欄，
+        資訊已不可逆遺失。
+      - 偵測到順序與 DOCUMENT_COLUMN_ORDER 不符時，寧可讓欄位留空
+        也不猜測，避免靜默產生欄位錯位的資料。
     """
     header_texts = [(x, t) for y, x, t in header_spans
                     if y < top and not is_rule(t)]
@@ -203,17 +254,40 @@ def infer_fields(lefts, header_spans, top, n_columns):
     # 合併 span 落選的別名：填入其右側最近的未配對欄位。
     # 例：'訂購單號料 號'(x=21) 同時含 ORD_NO 與 MATM_NAME，
     # ORD_NO 佔用欄位 0 後，落選的 MATM_NAME 應填入欄位 1。
-    for i, _dist, field in sorted(candidates, key=lambda c: (c[0], c[1])):
-        if field in used_fields:
-            continue
-        for j in range(i, n_columns):
-            if matched[j] is None:
-                matched[j] = field
-                used_fields.add(field)
-                break
+    #
+    # 此補位只在版面欄位順序與 DOCUMENT_COLUMN_ORDER 一致時才安全。
+    # 欄位順序若改變，PDF 引擎仍可能把相鄰欄位合併成同一個 span，
+    # 此時「往右填」會把別名塞進錯欄，因此改為不做補位並明確警告。
+    order_ok = (_order_matches_document(matched)
+                and not _merged_span_conflicts(candidates, n_columns))
+    if order_ok:
+        for i, _dist, field in sorted(candidates, key=lambda c: (c[0], c[1])):
+            if field in used_fields:
+                continue
+            for j in range(i, n_columns):
+                if matched[j] is None:
+                    matched[j] = field
+                    used_fields.add(field)
+                    break
+    else:
+        unmatched_alias = [f for _i, _d, f in candidates if f not in used_fields]
+        if unmatched_alias:
+            log("[warn] 表頭合併 span 含有未能歸位的欄位別名（%s），"
+                "且已偵測到欄位順序與預設不同，為避免欄位錯位不做補位。"
+                % ", ".join(sorted(set(unmatched_alias))))
 
-    # 仍無法判斷的欄位用已知欄位順序補齊
+    # 仍無法判斷的欄位
+    #
+    # 只有在欄位順序確定為本文件預設順序時，才能用已知順序補齊。
+    # 若表頭已判斷出至少一個欄位且其位置偏離預設順序，代表版面順序
+    # 與 DOCUMENT_COLUMN_ORDER 不同，此時套用固定順序會產生靜默錯位，
+    # 因此寧可留空也不要猜。
     if any(f is None for f in matched):
+        if not order_ok:
+            log("[warn] 部分欄位無法由表頭文字判斷，且已偵測到欄位順序"
+                "與預設不同。為避免欄位錯位，這些欄位留空不猜測，"
+                "請人工確認後再處理。")
+            return matched
         log("[warn] 部分欄位無法由表頭文字判斷，改以已知欄位順序補齊。")
         missing = [f for f in DOCUMENT_COLUMN_ORDER]
         for cur in matched:
@@ -225,6 +299,53 @@ def infer_fields(lefts, header_spans, top, n_columns):
                 matched[i] = pool.pop(0)
 
     return matched
+
+
+def _merged_span_conflicts(candidates, n_columns):
+    """
+    判斷「合併 span 往右補位」是否安全。
+
+    PDF 引擎會把相鄰兩欄的表頭併成同一個 span，例如
+    '交貨日期  訂購單號'。此時無法從 span 判斷哪個別名屬於哪一欄，
+    只能依序填入右側的未配對欄位 —— 這只在版面欄位順序與
+    DOCUMENT_COLUMN_ORDER 完全一致時才正確。
+
+    驗證方式：完整模擬一次補位，再檢查結果的欄位順序是否符合預設。
+    只要補位後順序不符，就代表版面順序已改變，此時補位會填錯欄。
+
+    candidates: [(欄位索引, 距離, 欄位名), ...]
+    """
+    assigned = {}
+    for i, _dist, field in sorted(candidates, key=lambda c: (c[1], c[0])):
+        assigned.setdefault(i, field)
+    used = set(assigned.values())
+
+    for i, _dist, field in sorted(candidates, key=lambda c: (c[0], c[1])):
+        if field in used:
+            continue
+        target = next((j for j in range(i, n_columns) if j not in assigned), None)
+        if target is None:
+            continue
+        assigned[target] = field
+        used.add(field)
+
+    ordered = [assigned.get(i) for i in range(n_columns)]
+    return not _order_matches_document(ordered)
+
+
+def _order_matches_document(matched):
+    """
+    判斷已判斷出的欄位是否符合 DOCUMENT_COLUMN_ORDER 的相對順序。
+
+    只要有任何一個已判斷欄位出現在比預設更靠左的位置，
+    就視為版面順序與預設不同，固定順序補齊將不安全。
+    """
+    known = {f: i for i, f in enumerate(DOCUMENT_COLUMN_ORDER) if f is not None}
+    seen = [(i, known[f]) for i, f in enumerate(matched) if f in known]
+    for (i1, k1), (i2, k2) in zip(seen, seen[1:]):
+        if k1 >= k2:
+            return False
+    return True
 
 
 def extract(pdf_path, dump=False):
@@ -252,13 +373,12 @@ def extract(pdf_path, dump=False):
                 raw = {}
                 for x, text in cells:
                     raw.setdefault(column_index(lefts, x), []).append(text)
-                if 0 not in raw:
-                    continue  # 沒有訂購單號，不是資料列
                 row = {}
                 for idx, parts in raw.items():
                     field = fields[idx] if idx < len(fields) else None
                     if field:
                         row[field] = "".join(parts)
+                # 以實際欄位名判定資料列，不假設 ORD_NO 一定在欄位 0
                 if "ORD_NO" in row:
                     page_records.append(row)
 
@@ -298,12 +418,17 @@ def collect_amounts(pdf_path):
             lefts, _source = detect_columns(spans, top, bottom, False)
             if DOC_AMOUNT_INDEX >= len(lefts):
                 continue
+            fields = infer_fields(lefts, spans, top, len(lefts))
+            # 以實際欄位名定位，而非假設欄位 0 就是訂購單號
+            if "ORD_NO" not in fields:
+                continue
+            ord_no_idx = fields.index("ORD_NO")
             for cells in cluster_rows(spans, top, bottom):
                 ord_no = None
                 amount = None
                 for x, text in cells:
                     idx = column_index(lefts, x)
-                    if idx == 0:
+                    if idx == ord_no_idx:
                         ord_no = text
                     elif idx == DOC_AMOUNT_INDEX:
                         amount = text
