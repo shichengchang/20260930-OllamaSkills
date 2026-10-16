@@ -5,6 +5,6 @@ __pycache__/
 *.log
 *.pdf
 !豐泰.pdf
-
+*.pptx
 # 解析結果集中於 output/，不納入版控
 output/
