@@ -9,6 +9,7 @@ check_env.py - 檢查執行環境：Python 版本、必要套件、輸入檔案�
 
 import os
 import sys
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -24,10 +25,26 @@ EMBEDDING_HINT = ("bge-m3", "qwen3-embedding")
 
 problems = []
 
+LABEL_WIDTH = 26
+
+
+def display_width(text):
+    """
+    計算字串在終端機的顯示寬度。
+    CJK 全形字元佔兩欄，用 len() 會低估，中文標籤因此無法對齊。
+    """
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in text)
+
+
+def pad(text, width=LABEL_WIDTH):
+    """依顯示寬度左靠齊補空白，超過寬度則原樣輸出。"""
+    return text + " " * max(0, width - display_width(text))
+
 
 def report(status, label, detail=""):
     mark = "OK  " if status == "ok" else ("WARN" if status == "warn" else "FAIL")
-    print("  [%s] %-22s %s" % (mark, label, detail))
+    print("  [%s] %s %s" % (mark, pad(label), detail))
     return status
 
 
@@ -77,7 +94,7 @@ else:
 print()
 print("=== 專案程式 ===")
 for name in ("fentay_common.py", "ollama_fentay.py", "pdf_text_fentay.py",
-             "test_fentay.py"):
+             "pdf_text_llm_fentay.py", "menu.py", "test_fentay.py"):
     if os.path.isfile(name):
         report("ok", name, "%.1f KB" % (os.path.getsize(name) / 1024))
     else:
@@ -110,6 +127,16 @@ if embedding:
 
 if not generation:
     report("fail", "generating model", "沒有可用的生成模型，路線 B 無法執行")
+
+print()
+print("=== 專案檔案 ===")
+# 取代舊版 run.bat 選項 6 最後的 dir /b；只列檔名以確認資料夾內容，
+# 不含子目錄的檔案（PDF/、output/ 等數量多且會快速變動）。
+for name in sorted(os.listdir(".")):
+    if os.path.isdir(name):
+        report("ok", name + "/", "目錄")
+    else:
+        report("ok", name, "%.1f KB" % (os.path.getsize(name) / 1024))
 
 print()
 print("=== 結論 ===")

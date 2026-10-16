@@ -28,6 +28,7 @@ SOURCE_LABELS = {
     "C": "C      - PDF 文字層直接解析（無 LLM）",
     "pure": "pure   - vision 模型讀圖並套用全部規則（測 Skill 指令是否有效）",
     "hybrid": "hybrid - vision 模型只讀表，規則由 Python 套用（實務做法）",
+    "textmap": "textmap- 文字層座標分組 + LLM 判斷欄位語意（規則由 Python 套用）",
 }
 
 

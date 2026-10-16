@@ -41,6 +41,8 @@ LLM 在這個專案有兩種**性質完全不同**的用法，兩者不可混為
 ```powershell
 python test_fentay.py                                                       # 單元測試
 python pdf_text_fentay.py --pdf ".\豐泰.pdf" --compare ".\expected.json"   # 路線 C
+python pdf_text_llm_fentay.py --pdf ".\豐泰.pdf" --model qwen3.5:4b \
+  --samples 10 --runs 3 --compare ".\expected.json"                       # 路線 D
 
 # 第二組用法：arm 比較（需本地 Ollama，約 20 分鐘）
 python test_classify_spec.py --samples 10
@@ -54,9 +56,11 @@ python make_layout_pdfs.py                                                 # 產
 ```
 fentay_common.py       規則的唯一實作（MAPPING.md 轉換規則 + 輸出契約）
 ├── ollama_fentay.py   路線 B：PDF → PNG → vision 模型 → JSON
-└── pdf_text_fentay.py 路線 C：PDF 文字層 → 座標分組 → JSON
+├── pdf_text_fentay.py 路線 C：PDF 文字層 → 座標分組 → JSON
+└── pdf_text_llm_fentay.py 路線 D：PDF 文字層 → 座標分組 → LLM 判欄位語意 → JSON
 
 test_fentay.py         單元測試
+menu.py                功能選單（run.bat 只負責啟動本檔）
 compare_results.py     批次比較所有 result.*.json
 ai_locate_experiment.py 實驗：AI 能否取代程式碼做版面定位
 test_classify_spec.py  arm 比較：餵多少規格文件才夠（第二組用法）
@@ -80,15 +84,16 @@ README_CLASSIFY.md     第二組的說明與實測結果
 
 ---
 
-## 兩條解析路線
+## 三條解析路線
 
-|          | 路線 B（vision） | 路線 C（文字層） |
-| -------- | ---------------- | ---------------- |
-| 原理     | PDF 渲染成 PNG 餵給 vision 模型 | 直接讀 PDF 文字層 |
-| 耗時     | 約 115 秒 / 2 頁 | **約 0.02 秒 / 2 頁** |
-| 外部依賴 | Ollama（16 GB 模型常駐） | 無 |
-| 掃描件   | 可處理 | **失效**（會明確報錯） |
-| 版面容忍 | 較高 | 較低（依賴表頭虛線定位欄位） |
+|          | 路線 B（vision） | 路線 C（文字層） | 路線 D（文字層 + LLM） |
+| -------- | ---------------- | ---------------- | --------------------- |
+| 原理     | PDF 渲染成 PNG 餵給 vision 模型 | 直接讀 PDF 文字層 | 讀文字層，欄位語意交給 LLM |
+| 耗時     | 約 115 秒 / 2 頁 | **約 0.02 秒 / 2 頁** | 約 3.5 秒 / 2 頁 |
+| 外部依賴 | Ollama（16 GB 模型常駐） | 無 | Ollama（文字模型） |
+| 掃描件   | 可處理 | **失效**（會明確報錯） | **失效**（會明確報錯） |
+| 版面容忍 | 較高 | 較低（依賴表頭虛線定位欄位） | 同路線 C |
+| LLM 的工作 | 從像素轉錄全部資料值 | 無 | 只判斷每欄代表哪個欄位名 |
 
 ### 兩種工作模式：`pure` 與 `hybrid`
 
@@ -123,6 +128,7 @@ hybrid 模式（模型只讀表，規則交給程式）
 | 組合 | 筆數 | 欄位正確率 | 耗時 |
 | ---- | ---- | ---------- | ---- |
 | 路線 C | 38/38 | 100.0% | 0.02 秒 |
+| 路線 D `qwen3.5:4b` 文字層 + LLM 判欄位 | 38/38 | **100.0%** | **3.4 秒** |
 | 路線 B `qwen3.5:4b` hybrid | 38/38 | **99.8%** | 116 秒 |
 | 路線 B `qwen3.5:4b` pure | 38/38 | 89.9% | 122 秒 |
 | 路線 B `gemma4:12b` hybrid | 35 | 75.5% | 441 秒 |
@@ -140,6 +146,114 @@ hybrid 模式（模型只讀表，規則交給程式）
 材料名稱中漏掉一個空格。原文的空格本身沒規律（38 筆中 3 筆在寬度後有空格、
 28 筆沒有），因此**沒有任何內部一致性訊號可用來判斷空格是否遺失**，
 只能靠 OCR 本身。目前無解。
+
+---
+
+## 路線 D：文字層 + LLM 判斷欄位語意
+
+`pdf_text_llm_fentay.py` 存在的唯一目的，是回答一個很窄的問題：
+
+> **把路線 B 的 hybrid 改成「PDF 轉文字、不用圖片」之後，會發生什麼事？**
+
+答案是：**幾乎不會發生任何事**，而這正是這個實驗要證明的事。
+
+### 為什麼 LLM 不負責轉錄
+
+路線 B hybrid 中，LLM 的工作是「從像素讀出每一格的字」。
+一旦輸入改成 PDF 文字層，程式碼**本來就已經持有完全精確的字元**
+（文字層即原始碼，沒有第二層的轉換）。此時再叫模型把字重打一遍，
+不會增加任何資訊，只會引入失真 — 像是路線 B 那個 `44" 黑保利2`
+變成 `44"黑保利2` 的空格遺失。
+
+所以路線 D 把 LLM 的職責收斂到**只剩一個決策**：
+
+```
+路線 B hybrid（圖片）              路線 D（文字）
+─────────────────────             ──────────────────────────────
+LLM 從像素轉錄全部值  ← 有貢獻     程式碼從文字層取值  ← 精確且免費
+LLM 套用 MAPPING 規則             LLM 判斷欄位語意    ← 唯一的決策
+程式碼組裝 JSON                    程式碼套用同一份 MAPPING 規則
+```
+
+而「判斷欄位語意」這件事，恰好就是路線 C 的 `infer_fields()` 所做的。
+
+### 與路線 C 的關係：**只有一個函式不同**
+
+```
+路線 C   座標分組 -> infer_fields() 由表頭文字比對 -> apply_mapping()
+路線 D   座標分組 -> LLM 回傳 mapping 陣列         -> apply_mapping()
+```
+
+擷取層（`collect_spans` / `detect_columns` / `cluster_rows` /
+`column_index`）**完全共用**，資料值逐字相同。
+
+> **因此「100%」要怎麼解讀：**
+> 路線 D 的 38 筆 / 456 格比對中，**只有 10 個欄位對應具備獨立性**，
+> 因為資料值層與路線 C 同源。這 100% 證明的是「LLM 能取代 `infer_fields()`」，
+> **不是**資料擷取層另有獨立證據。資料擷取層的獨立證據仍是
+> `QTY × PRICE ≈ 金額` 交叉驗證（實測 38/38 通過）。
+
+### 實測結果（`qwen3.5:4b`）
+
+| 項目 | 結果 |
+| ---- | ---- |
+| 筆數 | 38/38 |
+| 欄位正確率 | 100.0%（456 格） |
+| mapping 一致性 | `--runs 3` → 3/3 完全相同 |
+| 耗時 | 約 3.4 秒（prompt 1413 tokens / output 45 tokens） |
+| `QTY × PRICE` 交叉驗證 | 38/38 通過，0 不一致 |
+
+在 `PDF/` 的 10 份真實訂單（合計 65 列）上重測：
+
+| 項目 | 結果 |
+| ---- | ---- |
+| 檔數 | 10/10 全部產出結果 |
+| 總筆數 | 65 |
+| mapping | 10 份全部相同，且與路線 C 的 `infer_fields()` 結果一致 |
+| `QTY × PRICE` 交叉驗證 | 65/65 通過，0 不一致 |
+| 單檔耗時 | 約 3.8 ~ 4.5 秒 |
+
+### 結論：這條路線證明了「不需要 AI」，而且證明得更徹底
+
+路線 D 的輸出與路線 C **完全相同**，差別只在於欄位名稱是誰決定的。
+而 LLM 要的代價是 3.4 秒（路線 C 是 0.02 秒）。
+
+| | 路線 C | 路線 D |
+| - | -------- | -------- |
+| 欄位正確率 | 100% | 100% |
+| 耗時 | 0.02 秒 | 3.4 秒 |
+| 外部依賴 | 無 | Ollama 必須在跑 |
+| 失敗模式 | 表頭被破壞時欄位語意失效 | 多一層：LLM 可能回錯 mapping |
+
+結論與本文件其他章節一致，而且更強：
+**把圖片換成文字並不足以讓 LLM 變得有價值；
+AI 唯一做得到的判斷，確定性方法本來就已經做到了。**
+
+### 路線 D 與 `FENTAY_B2B_CLASSIFY/` 的關係（不要混淆）
+
+兩者都在做「LLM 只判斷欄位」，但**不是同一件事**：
+
+| | 路線 D | `FENTAY_B2B_CLASSIFY/` |
+| --- | --- | --- |
+| prompt 從哪來 | **程式碼**組出，欄位詞彙由 `fentay_common` 的 `FIELDS` / `HEADER_ALIASES` 推導 | 三份 `.md` 規格文件全文注入 |
+| 用途 | 已可執行的第四條解析路線 | arm 比較的實驗規格，**仍未接軌任何程式** |
+| arm 比較 | 未做 | 已做（A0~A3，見 [README_CLASSIFY.md](README_CLASSIFY.md)） |
+
+路線 D **沒有**讓 `FENTAY_B2B_CLASSIFY/` 接軌。它是獨立實作的另一條路徑，
+用來量測「LLM 判欄位」在真實流水線上的表現。兩者的 arm 比較結果不可互相推論。
+
+### 嚴格驗證：寧可報錯也不猜
+
+欄位語意錯了會讓整份輸出**靜默錯位**（QTY 對到 UNIT），而 `validate()`
+不會發出任何警告。因此 `parse_mapping()` 採取以下處置，一律中止而非猜測：
+
+| 情況 | 處置 |
+| ---- | ---- |
+| mapping 長度 ≠ 該頁欄數 | 中止並列出兩者數值 |
+| 欄位名無法解析成合法匯入欄位 | 中止並列出無法解析的字串 |
+| 同一欄位名重複出現 | 中止（語意錯的明確訊號） |
+| 各頁欄數不一致 | 只套用到多數頁，其餘頁跳過並在報告中記錄 |
+| `--runs > 1` 且無嚴格多數 | 中止（寧可失敗也不任選其一） |
 
 ---
 
@@ -245,7 +359,8 @@ vision 模型在低解析度下會把數字 `0` 認成字母 `O`：
 - **座標偵測** —— 實測 AI 要求輸出欄位邊界時會直接崩盤，
   把輸入的所有 x 值原封不動倒出來（見「AI 版面定位實驗」）。
 - **欄位語意判斷** —— AI 雖能做到 100%，但確定性方法同樣是 100% 且快 200 倍，
-  導入 AI 只有延遲成本。
+  導入 AI 只有延遲成本。路線 D 就是為了把這句話做成一條可重現的程式：
+  它輸出與路線 C 完全相同的結果，只花了 3.4 秒與一個額外的相依項。
 
 換言之，AI 在這條流水線上目前**沒有可貢獻的環節**。
 
@@ -807,18 +922,42 @@ Ground truth 取自 `pdf_text_fentay` 的確定性方法，不是人工標註，
 run.bat
 ```
 
-| 選項 | 功能 | 耗時 |
-| ---- | ---- | ---- |
-| 1 | 單元測試（89 項） | 約 2 秒 |
-| 2 | 路線 C：文字層解析（無需 Ollama） | 約 1 秒 |
-| 3 | 路線 B：`qwen3.5:4b` + hybrid（推薦） | 約 2 分鐘 |
-| 4 | 路線 B：完整矩陣（2 模型 × 2 模式） | 約 20 分鐘 |
-| 5 | 比較所有既有結果 | 立即 |
-| 6 | 環境檢查（Python / 套件 / Ollama / 模型） | 立即 |
-| 0 | 離開 | — |
+`run.bat` 只是一個啟動器（切換工作目錄、設定 UTF-8、啟動 Python），
+選單本身在 `menu.py`。選項定義集中在 `menu.py` 的 `ACTIONS` 表，
+**新增解析路線只要加一列**，不必再到 `.bat` 同步選單文字與分支。
+
+選項的前置條件是宣告式的：只有「需要 PDF」或「需要 Skill 規格檔」的選項
+會被擋下，不會連帶影響其他選項。
+
+| 選項 | 功能 | 耗時 | 前置條件 |
+| ---- | ---- | ---- | -------- |
+| 1 | 單元測試（89 項） | 約 2 秒 | — |
+| 2 | 路線 C：文字層解析（無需 Ollama） | 約 1 秒 | PDF |
+| 3 | 路線 B：`qwen3.5:4b` + hybrid（推薦） | 約 2 分鐘 | PDF、`FENTAY_B2B/` |
+| 4 | 路線 B：完整矩陣（2 模型 × 2 模式） | 約 20 分鐘 | PDF、`FENTAY_B2B/` |
+| 5 | 比較所有既有結果 | 立即 | — |
+| 6 | 環境檢查（Python / 套件 / Ollama / 模型） | 立即 | — |
+| 7 | 路線 D：文字層 + LLM 判斷欄位語意 | 約 5 秒 | PDF |
+| 0 | 離開 | — | — |
 
 選項 4 執行前會要求確認。選項 6 會自動略過 embedding 模型
 （`bge-m3`、`qwen3-embedding`），它們不能做生成。
+選項 7 會先確認 Ollama 可連線且模型存在，否則列出可用模型後中止。
+
+指定 Python 直譯器（例如機器上有多個 Python）：
+
+```powershell
+set PYTHON=C:\ProgramData\anaconda3\python.exe
+run.bat
+```
+
+子腳本一律以 `sys.executable` 啟動，確保與選單本身是同一個直譯器。
+
+也可以完全跳過選單，直接列出選項表：
+
+```powershell
+python menu.py --list
+```
 
 ### 直接執行
 
@@ -833,6 +972,10 @@ python ollama_fentay.py --pdf ".\豐泰.pdf" --skill-dir ".\FENTAY_B2B" `
 # 路線 B（pure：規則交給模型執行，用於測試 Skill 指令是否有效）
 python ollama_fentay.py --pdf ".\豐泰.pdf" --skill-dir ".\FENTAY_B2B" `
   --model qwen3.5:4b --mode pure --compare ".\expected.json"
+
+# 路線 D（LLM 只判斷欄位語意；--runs 3 用於量測非確定性）
+python pdf_text_llm_fentay.py --pdf ".\豐泰.pdf" --model qwen3.5:4b `
+  --samples 10 --runs 3 --compare ".\expected.json" --dump-columns
 ```
 
 ---
@@ -848,6 +991,8 @@ output/
 ├── result.qwen3.5_4b.hybrid.json
 ├── result.qwen3.5_4b.hybrid.20260930-145945.report.txt
 ├── result.qwen3.5_4b.hybrid.20260930-151811.report.txt
+├── result.qwen3.5_4b.textmap.json                 ← 路線 D
+├── result.qwen3.5_4b.textmap.20261016-132416.report.txt
 └── ...
 ```
 
@@ -889,7 +1034,32 @@ output/
 是為了不影響既有的 `{success, recordCount, data}` 結構，
 下游取用 `data` 的程式碼無需修改。
 
-報告檔（`.report.txt`）開頭也記錄產出時間、開始時間與耗時。
+`pdf_text_llm_fentay.py` 產出的 JSON 附帶的 `_meta.source`：
+
+```json
+{
+  "route": "D",
+  "mode": "hybrid",
+  "input": "text-layer",
+  "llmRole": "column-mapping",
+  "model": "qwen3.5:4b",
+  "pdf": "豐泰.pdf",
+  "samples": 10,
+  "mappingRuns": 1,
+  "mappingAgreed": true,
+  "mapping": ["ORD_NO", "MATM_NAME", "MATM_DESC", "WIDE", "QTY",
+              "UNIT", "PRICE", null, "NEED_DATE", "NEED_CUST"],
+  "pages": 2,
+  "ocrColorCodeFixed": 0
+}
+```
+
+`mapping` 一併寫入輸出，是為了讓「這份資料的欄位語意是誰決定的」在
+事後診斷時可以直接從 JSON 看出，而不必回頭查報告檔。
+
+### 報告檔（`.report.txt`）
+
+報告檔開頭也記錄產出時間、開始時間與耗時。
 檔名格式為 `result.<來源>.<YYYYMMDD-HHMMSS>.report.txt`。
 
 用 `--out-dir` 可改變輸出位置；`pdf_text_fentay.py --report` 可指定報告檔路徑。
@@ -913,6 +1083,17 @@ output/
 | ---- | ---- |
 | `--dump-columns` | 輸出欄位偵測診斷（換版式時先跑這個） |
 | `--show-diffs N` | 差異明細顯示筆數 |
+
+`pdf_text_llm_fentay.py`
+
+| 參數 | 說明 |
+| ---- | ---- |
+| `--samples N` | 交給 LLM 判斷欄位語意的樣本列數，預設 10（跨頁輪流取樣） |
+| `--runs N` | LLM 呼叫次數；>1 時取嚴格多數，無多數則中止 |
+| `--model` | 可重複指定以比較多個模型 |
+| `--num-predict` | 預設 512（mapping 僅約 45 tokens，遠小於路線 B 的 16384） |
+| `--timeout` | 預設 600 秒（單次小呼叫，不需路線 B 的 3600） |
+| `--dump-columns` | 同路線 C |
 
 ---
 
@@ -963,6 +1144,17 @@ pip install PyMuPDF requests
    實測結果與已知缺陷見 [README_CLASSIFY.md](README_CLASSIFY.md)。
 8. **CLASSIFY 的 arm 比較僅用單一模型。** arm 排名以 `qwen3.5:4b` 為準，
    `gemma4:12b` 尚未跑 arm 比較，排名是否跨模型一致未確認。
+9. **路線 D 只測過單一模型、單一供應商。** 實測為 `qwen3.5:4b` 加上
+   `豐泰.pdf` 與 `PDF/` 的 10 份同版式訂單，尚未跑 `gemma4:12b` 對照。
+   另外，兩點限制要注意：
+   - **資料值層與路線 C 完全同源**，所以它的「100%」只證明欄位語意判斷正確，
+     不構成資料擷取層的獨立證據（獨立證據只有 `QTY × PRICE` 交叉驗證）。
+   - **樣本數受單一檔案的列數限制**。路線 D 是「每份 PDF 呼叫一次 LLM」，
+     因此 `6B55H.pdf`（全檔僅 1 列）只給得出 1 列樣本。實測仍判斷正確，
+     但這是因為該欄位內容自我說明；換成自我說明程度低的欄位可能不足。
+10. **路線 D 的 output 檔名是 `result.<model>.textmap.json`。** 
+   `compare_results.py` 以 `result.*.json` 遞迴比對，會自動納入，
+   來源標籤需對應 `compare_results.py` 的 `SOURCE_LABELS`。
 
 ---
 
@@ -989,6 +1181,10 @@ pip install PyMuPDF requests
 SKILL.md）；**把程式碼抽到的表頭餵給模型有害無益**。
 
 詳見 [README_CLASSIFY.md](README_CLASSIFY.md)。
+
+> **路線 D 與第二組的關係**：路線 D 是「LLM 只判斷欄位」的**第四條可執行
+> 路線**，但它的 prompt 由程式碼組出，**沒有**用到 `FENTAY_B2B_CLASSIFY/`
+> 的三份規格文件，因此第二組**仍然未接軌**。兩者的實驗結果不可互相推論。
 
 ---
 
