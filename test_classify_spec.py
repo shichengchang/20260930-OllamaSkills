@@ -122,6 +122,63 @@ def call_ollama(host, model, prompt, num_predict, timeout):
     }
 
 
+def load_openrouter_key():
+    """從 .env 讀取 OpenRouter API key。"""
+    path = os.path.join(BASE_DIR, ".env")
+    if not os.path.isfile(path):
+        sys.exit("找不到 .env")
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            for name in ("openrouter", "OPENROUTER_API_KEY", "OPENROUTER"):
+                if line.lower().startswith(name.lower() + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    sys.exit(".env 中找不到 OpenRouter API key")
+
+
+def call_openrouter(model, prompt, num_predict, timeout, key=None):
+    """
+    呼叫 OpenRouter 的 chat/completions 端點。
+
+    與本地 Ollama 的差異：
+      - 回應欄位為 choices[0].message.content（Ollama 是 response）
+      - token 統計在 usage（Ollama 是 prompt_eval_count）
+      - 無法保證支援 format=json，改以提示詞要求 JSON 輸出
+    """
+    key = key or load_openrouter_key()
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system",
+             "content": "你是資料格式判斷器，只輸出 JSON，不要任何解釋文字。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": num_predict,
+    }
+    started = time.time()
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": "Bearer %s" % key,
+                 "Content-Type": "application/json",
+                 "HTTP-Referer": "https://openrouter.ai",
+                 "X-Title": "fentay-classify-test"},
+        json=payload, timeout=timeout)
+    if response.status_code != 200:
+        sys.exit("OpenRouter 回應 %d: %s"
+                 % (response.status_code, response.text[:300]))
+    body = response.json()
+    usage = body.get("usage") or {}
+    return {
+        "text": (body["choices"][0]["message"].get("content") or ""),
+        "elapsed": round(time.time() - started, 1),
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "eval_tokens": usage.get("completion_tokens"),
+    }
+
+
 # ------------------------------------------------------------- prompt 組裝
 
 def build_prompt(arm, docs, columns, headers=None, samples=None):
@@ -451,6 +508,37 @@ def _pdf_case(path, label, contaminated, with_headers=False):
             "total_rows": len(samples)}
 
 
+def anonymize_case(case):
+    """
+    將案例的樣本列匿名化，並在送出前審計。
+
+    匿名化只替換號碼與名稱類欄位（訂購單號、料號、材料描述、
+    子公司代碼），數值欄保持原值 —— 單一數值不具識別性，
+    但位數與小數位是 MAPPING.md 判斷 QTY / PRICE 的依據。
+    """
+    if not case.get("rows"):
+        return case, None
+    fields = case["truth"]
+    anon_mod = load("anonymize_samples.py")
+    amount_index = next((i for i, f in enumerate(fields) if f is None), None)
+    try:
+        new_rows, note = anon_mod.anonymize_rows(
+            case["rows"], fields, amount_index=amount_index)
+    except Exception as exc:
+        sys.exit("匿名化失敗（%s）：%s" % (case["name"], exc))
+
+    ok, report = anon_mod.audit(case["rows"], new_rows, fields)
+    if not ok:
+        sys.exit("匿名化審計未通過，拒絕送出：\n%s" % report)
+
+    out = dict(case)
+    out["rows"] = new_rows
+    out["anonymized"] = True
+    out["anonymize_note"] = note
+    out["anonymize_report"] = report
+    return out, report
+
+
 def pdf_cases(with_headers=False, limit=None):
     """PDF/ 目錄下的測試檔案。"""
     if not os.path.isdir(PDF_DIR):
@@ -496,7 +584,25 @@ def main():
     parser.add_argument("--samples", type=int, default=3,
                         help="給模型看幾列樣本")
     parser.add_argument("--dump-prompt", action="store_true")
+    parser.add_argument("--openrouter", action="store_true",
+                        help="改用 OpenRouter 呼叫（資料會離開本機）")
+    parser.add_argument("--anonymize", action="store_true",
+                        help="送出前匿名化樣本列（配合 --openrouter 使用）")
+    parser.add_argument("--openrouter-model",
+                        default="stealth/space-bunny-alpha",
+                        help="OpenRouter 上的模型 id")
     args = parser.parse_args()
+
+    if args.anonymize and not args.openrouter:
+        sys.exit("--anonymize 需搭配 --openrouter 使用")
+
+    if args.openrouter and not args.anonymize:
+        print("=" * 72)
+        print("警告：未使用 --anonymize，真實訂單資料將直接送往外部服務。")
+        print("=" * 72)
+        confirm = input("確定要繼續送出真實資料嗎？輸入 yes 繼續: ")
+        if confirm.strip().lower() != "yes":
+            sys.exit("已取消")
 
     docs = {
         "skill": read_skill_doc("SKILL.md"),
@@ -509,6 +615,9 @@ def main():
     print("FENTAY_B2B_CLASSIFY 規格可實作性 + arm 比較")
     print("模型: %s   每案例 %d 次   樣本列數: %d" % (args.model, args.runs, args.samples))
     print("要比較的 arm: %s" % ", ".join("%s(%s)" % (a, ARM_DESC[a]) for a in args.arms))
+    if args.openrouter:
+        print("後端: OpenRouter  模型: %s" % args.openrouter_model)
+        print("匿名化: %s" % ("開啟" if args.anonymize else "關閉"))
     print("=" * 72)
 
     results = []
@@ -533,6 +642,9 @@ def main():
         print("")
         print("### %s" % group_name)
         for case in cases:
+            anon_report = None
+            if args.anonymize:
+                case, anon_report = anonymize_case(case)
             n = case["columns"]
             rows = case["rows"][:args.samples]
             flag = "【汙染】" if case["contaminated"] else ""
@@ -553,7 +665,13 @@ def main():
 
                 scores, times, ptoks, outs, viols = [], [], [], [], []
                 for _ in range(args.runs):
-                    resp = call_ollama(args.host, args.model, prompt, 700, args.timeout)
+                    if args.openrouter:
+                        resp = call_openrouter(
+                            args.openrouter_model, prompt, 700,
+                            args.timeout)
+                    else:
+                        resp = call_ollama(args.host, args.model, prompt,
+                                           700, args.timeout)
                     times.append(resp["elapsed"])
                     ptoks.append(resp["prompt_tokens"] or 0)
                     mapping, v = parse_mapping(resp["text"], n)
@@ -594,6 +712,7 @@ def main():
                 "columns": n, "contaminated": case["contaminated"],
                 "trustworthy": case.get("trustworthy"),
                 "cross_verified": case.get("cross_verified"),
+                "anonymized": bool(args.anonymize),
                 "truth": case["truth"],
                 "arms": {a: per_arm[a] for a in args.arms},
             })
@@ -644,9 +763,17 @@ def main():
 
     out_path = os.path.join(BASE_DIR, "output", "classify_arm_results.json")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    suffix = "_openrouter" if args.openrouter else ""
+    if args.anonymize:
+        suffix += "_anon"
+    out_path = out_path.replace(".json", suffix + ".json")
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump({"model": args.model, "runs": args.runs,
-                   "arms": args.arms, "samples": args.samples,
+        json.dump({"model": args.model if not args.openrouter
+                   else args.openrouter_model,
+                   "backend": "openrouter" if args.openrouter else "ollama",
+                   "anonymized": bool(args.anonymize),
+                   "runs": args.runs, "arms": args.arms,
+                   "samples": args.samples,
                    "results": results}, f, ensure_ascii=False, indent=2, default=str)
     print("")
     print("結果已寫入: %s" % out_path)
