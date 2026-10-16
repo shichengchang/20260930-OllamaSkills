@@ -32,6 +32,7 @@ pdf_text_llm_fentay.py - 路線 D：PDF 文字層（座標分組） + LLM 只判
 
 import argparse
 import collections
+import glob
 import json
 import os
 import sys
@@ -394,8 +395,37 @@ def run_route_d(host, args, model, pages, grids, n_columns, prompt):
     return {"success": True, "recordCount": len(records), "data": records}, diagnostics, None
 
 
-def build_report(args, model, result, diagnostics, expected, problems,
-                 elapsed, started_at, ocr_fixed, cross_check, out_path, report_path):
+def mapping_agreement(pdf_path, mapping, max_pages=0):
+    """
+    比對 LLM 的 mapping 與確定性方法 pt.infer_fields() 的結果。
+
+    這不是「比對基準答案」，而是兩個彼此獨立的欄位判定來源互相比對：
+    一個讀表頭文字比對，一個讀欄位內容交給模型判斷。
+
+    因此解讀方向不對稱：
+      - 不一致 → 一定是某一方錯了，必須追查
+      - 一致   → 只代表兩種做法得到同一答案，**不構成正確性的證據**
+    """
+    doc = fitz.open(pdf_path)
+    try:
+        last_page = min(doc.page_count, max_pages) if max_pages else doc.page_count
+        for page_index in range(last_page):
+            spans = pt.collect_spans(doc[page_index])
+            top, bottom, _ = pt.find_table_bounds(spans)
+            if top is None:
+                continue
+            lefts, _source = pt.detect_columns(spans, top, bottom, False)
+            if not lefts:
+                continue
+            return list(pt.infer_fields(lefts, spans, top, len(lefts)))
+    finally:
+        doc.close()
+    return None
+
+
+def build_report(args, model, result, diagnostics, problems,
+                 elapsed, started_at, ocr_fixed, cross_check, agreement,
+                 pdf_name, out_path, report_path):
     lines = [
         "產出時間: %s" % result["_meta"]["generatedAt"],
         "開始時間: %s" % started_at,
@@ -406,7 +436,7 @@ def build_report(args, model, result, diagnostics, expected, problems,
         "樣本列數: %d（跨頁輪流取樣）" % args.samples,
         "執行次數: %d，各次 mapping 是否一致: %s"
         % (args.runs, "是" if diagnostics["agreed"] else "否（已取多數）"),
-        "輸入 PDF: %s" % os.path.basename(args.pdf),
+        "輸入 PDF: %s" % pdf_name,
         "欄位對應: %s" % diagnostics["mapping"],
         "OCR 色碼修正: %d 筆（文字層解析，預期為 0）" % ocr_fixed,
         "輸出 JSON: %s" % out_path,
@@ -450,25 +480,240 @@ def build_report(args, model, result, diagnostics, expected, problems,
     for ord_no, calc, amount in cross_check["mismatches"][:10]:
         lines.append("  %s 計算=%s PDF金額=%s" % (ord_no, calc, amount))
 
-    if expected is not None:
-        lines += [
-            "",
-            "=== 與基準答案比對 ===",
-            "注意: 本路線的資料值層與路線 C 同源（共用文字層擷取函式），",
-            "      因此比對結果只有『欄位語意』具備獨立性，",
-            "      資料擷取層的獨立證據請看上面的 QTY x PRICE 交叉驗證。",
-            "",
-            compare(expected, result, show=args.show_diffs, full=True),
-        ]
+    lines += [
+        "",
+        "=== 與確定性方法 infer_fields() 的交叉比對 ===",
+        "注意: 這不是比對基準答案，而是兩個獨立的欄位判定來源互相比對。",
+        "      不一致 = 至少一方錯了，必須追查；一致 ≠ 正確，僅代表兩者結論相同。",
+    ]
+    if agreement is None:
+        lines.append("  無法取得 infer_fields() 結果")
+    elif agreement["agreed"]:
+        lines.append("  一致（%d 欄）" % len(agreement["code_mapping"]))
+    else:
+        lines.append("  不一致！差異欄位：")
+        for item in agreement["diffs"]:
+            lines.append("    欄 %d: LLM=%s / 程式=%s" % item)
 
     lines += ["", "完整報告: %s" % report_path]
     return "\n".join(lines)
 
 
+def process_pdf(host, args, model, pdf_path, dump):
+    """
+    處理單一 PDF：擷取文字層 -> LLM 判欄位語意 -> 套規則 -> 交叉驗證。
+
+    回傳 dict；其中 error 非 None 代表未產生結果，其餘欄位僅供彙總使用。
+    """
+    name = os.path.basename(pdf_path)
+    info = {"pdf": name, "model": model, "error": None}
+
+    pages, grids = extract_grid(pdf_path, args.max_pages, dump)
+    n_columns = choose_column_count(pages)
+    if not n_columns:
+        info["error"] = "找不到可用的表格欄位，可能是掃描件（無文字層）"
+        return info
+
+    allowed = [i for i, p in enumerate(pages) if p["n_columns"] == n_columns]
+    log("表格欄數: %d（符合此欄數的頁: %s）"
+        % (n_columns, ", ".join(str(pages[i]["page"]) for i in allowed)))
+    for i, page in enumerate(pages):
+        if page["n_columns"] and page["n_columns"] != n_columns:
+            log("[warn] 第 %d 頁欄數 %d 與多數頁不同，將於套用 mapping 時跳過"
+                % (page["page"], page["n_columns"]))
+
+    samples = pick_samples(grids, allowed, max(1, args.samples))
+    log("取樣 %d 列給 LLM 判斷欄位語意" % len(samples))
+    prompt = build_prompt(samples, n_columns)
+
+    started_at = now_iso()
+    started = time.time()
+    result, diagnostics, error = run_route_d(
+        host, args, model, pages, grids, n_columns, prompt)
+    elapsed = time.time() - started
+
+    if error:
+        info["error"] = error
+        return info
+
+    diagnostics["pages"] = pages
+    result["data"], ocr_fixed = apply_ocr_fixes(result.get("data", []))
+    if ocr_fixed:
+        log("  OCR 失真修正: %d 筆" % ocr_fixed)
+
+    problems = validate(result)
+
+    build_output(
+        result,
+        source={
+            "route": "D",
+            "mode": "hybrid",
+            "input": "text-layer",
+            "llmRole": "column-mapping",
+            "model": model,
+            "pdf": name,
+            "samples": len(samples),
+            "mappingRuns": args.runs,
+            "mappingAgreed": diagnostics["agreed"],
+            "mapping": diagnostics["mapping"],
+            "pages": len(allowed),
+            "ocrColorCodeFixed": ocr_fixed,
+        },
+        elapsed_sec=elapsed,
+        started_at=started_at,
+    )
+
+    # 獨立交叉驗證：重新從 PDF 取「金額」欄，不依賴 expected.json。
+    # 註：此處沿用 pdf_text_fentay.collect_amounts，其內部以 infer_fields
+    # 定位訂單欄，僅作為金額字典的鍵，不影響本路線受測的欄位 mapping。
+    log("  執行獨立交叉驗證 (QTY x PRICE vs 金額)...")
+    cross_check = {"verified": 0, "mismatches": [], "total": len(result["data"])}
+    try:
+        amounts = pt.collect_amounts(pdf_path)
+        verified, mismatches = pt.cross_validate(result["data"], amounts)
+        cross_check["verified"] = verified
+        cross_check["mismatches"] = mismatches
+    except Exception as exc:
+        log("[warn] 交叉驗證執行失敗: %s" % exc)
+        cross_check["error"] = str(exc)
+
+    code_mapping = None
+    try:
+        code_mapping = mapping_agreement(pdf_path, diagnostics["mapping"],
+                                         args.max_pages)
+    except Exception as exc:
+        log("[warn] infer_fields 交叉比對失敗: %s" % exc)
+
+    agreement = None
+    if code_mapping is not None:
+        diffs = [(i, diagnostics["mapping"][i], code_mapping[i])
+                 for i in range(min(len(code_mapping), len(diagnostics["mapping"])))
+                 if code_mapping[i] != diagnostics["mapping"][i]]
+        agreement = {
+            "agreed": not diffs,
+            "code_mapping": code_mapping,
+            "diffs": diffs,
+        }
+        if diffs:
+            log("  [warn] 與 infer_fields() 不一致，差異欄位: %s"
+                % ", ".join("欄%d(LLM=%s/程式=%s)" % d for d in diffs))
+        else:
+            log("  與 infer_fields() 一致（%d 欄）" % len(code_mapping))
+
+    info.update({
+        "recordCount": result.get("recordCount"),
+        "validation_issues": len(problems),
+        "cross_verified": cross_check["verified"],
+        "cross_mismatches": len(cross_check["mismatches"]),
+        "mapping": diagnostics["mapping"],
+        "mapping_agreed": None if agreement is None else agreement["agreed"],
+        "columns": n_columns,
+        "elapsed_sec": round(elapsed, 1),
+        # 以下供 main() 在輸出路徑確定後組報告使用
+        "result": result,
+        "diagnostics": diagnostics,
+        "problems": problems,
+        "cross_check": cross_check,
+        "agreement": agreement,
+        "ocr_fixed": ocr_fixed,
+        "elapsed": elapsed,
+        "started_at": started_at,
+    })
+    return info
+
+
+def collect_inputs(args):
+    """依 --pdf / --pdf-dir 決定要處理的檔案清單；回傳 (檔案清單, 是否批次)。"""
+    if args.pdf:
+        return [args.pdf], False
+    if args.pdf_dir:
+        if not os.path.isdir(args.pdf_dir):
+            sys.exit("找不到目錄: %s" % args.pdf_dir)
+        paths = sorted(glob.glob(os.path.join(args.pdf_dir, "*.pdf")))
+        if not paths:
+            sys.exit("目錄內沒有 *.pdf: %s" % args.pdf_dir)
+        return paths, True
+    sys.exit("請指定 --pdf 或 --pdf-dir")
+
+
+def write_summary(out_dir, model, infos):
+    """
+    寫出批次彙總。
+
+    沒有基準答案可比對時，這份檔案就是唯一的整體結果紀錄，
+    因此同時輸出文字版（人看）與 JSON 版（程式讀）。
+    """
+    ok = [i for i in infos if not i["error"]]
+    lines = [
+        "產出時間: %s" % now_iso(),
+        "模型: %s" % model,
+        "檔案數: %d（成功 %d，失敗 %d）"
+        % (len(infos), len(ok), len(infos) - len(ok)),
+        "",
+        "%-14s %6s %6s %8s %10s %8s %s"
+        % ("PDF", "筆數", "欄數", "交叉驗證", "不一致", "耗時", "與 infer_fields 一致"),
+    ]
+    for info in infos:
+        if info["error"]:
+            lines.append("%-14s %s" % (info["pdf"], "失敗: " + info["error"]))
+            continue
+        verified = "%d/%d" % (info["cross_verified"], info["recordCount"])
+        agree = {True: "是", False: "否（需追查）", None: "n/a"}[info["mapping_agreed"]]
+        lines.append("%-14s %6d %6d %8s %10d %7.1fs %s"
+                     % (os.path.splitext(info["pdf"])[0], info["recordCount"],
+                        info["columns"], verified, info["cross_mismatches"],
+                        info["elapsed_sec"], agree))
+
+    lines += [
+        "",
+        "=== 彙總數字 ===",
+        "總筆數: %d" % sum(i["recordCount"] for i in ok),
+        "交叉驗證通過: %d / %d"
+        % (sum(i["cross_verified"] for i in ok),
+           sum(i["recordCount"] for i in ok)),
+        "交叉驗證不一致: %d" % sum(i["cross_mismatches"] for i in ok),
+        "與 infer_fields() 一致的檔案: %d / %d"
+        % (sum(1 for i in ok if i["mapping_agreed"] is True), len(ok)),
+        "LLM 產生的不同 mapping 種類數: %d"
+        % len({tuple(i["mapping"]) for i in ok}),
+        "",
+        "注意: PDF/ 內沒有基準答案，因此本表沒有『正確率』。",
+        "      可用的獨立證據有兩個：",
+        "        1) QTY x PRICE ≈ 金額  → 偵測欄位錯位與資料列對錯",
+        "        2) 與 infer_fields() 一致 → 兩個獨立判定來源結論相同",
+        "      兩者都無法證明欄位語意本身正確，只能證明沒有明顯錯位。",
+    ]
+
+    text_path = os.path.join(out_dir, "summary.%s.txt" % model.replace(":", "_"))
+    with open(text_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    payload = {
+        "model": model,
+        "generatedAt": now_iso(),
+        "fileCount": len(infos),
+        "successCount": len(ok),
+        "totalRecords": sum(i["recordCount"] for i in ok),
+        "crossVerified": sum(i["cross_verified"] for i in ok),
+        "crossMismatches": sum(i["cross_mismatches"] for i in ok),
+        "agreedWithInferFields": sum(1 for i in ok if i["mapping_agreed"] is True),
+        "distinctMappings": [list(m) for m in {tuple(i["mapping"]) for i in ok}],
+        "files": [{k: v for k, v in i.items()
+                   if k not in ("result", "diagnostics", "problems",
+                                "cross_check", "agreement")} for i in infos],
+    }
+    json_path = os.path.join(out_dir, "summary.%s.json" % model.replace(":", "_"))
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return text_path, json_path
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="路線 D：PDF 文字層 + LLM 判斷欄位語意，輸出 FENTAY_B2B JSON")
-    parser.add_argument("--pdf", required=True, help="PDF 路徑")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--pdf", help="單一 PDF 路徑")
+    source.add_argument("--pdf-dir", help="目錄，批次處理其中所有 *.pdf")
     parser.add_argument("--model", action="append", default=None,
                         help="模型名稱，可重複指定以比較多個模型")
     parser.add_argument("--host", default=DEFAULT_HOST)
@@ -485,15 +730,23 @@ def main():
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--json-format", choices=["json", "none"], default="json")
     parser.add_argument("--out-dir", default=None, help="輸出目錄，預設 output/")
-    parser.add_argument("--out-base", default="result", help="輸出檔名前綴")
-    parser.add_argument("--compare", default=None, help="基準答案 JSON 路徑")
+    parser.add_argument("--out-base", default="result",
+                        help="輸出檔名前綴（僅單檔模式使用）")
+    parser.add_argument("--compare", default=None,
+                        help="基準答案 JSON 路徑（僅單檔模式）")
     parser.add_argument("--show-diffs", type=int, default=10,
                         help="console 顯示的差異筆數，-1 代表全部（報告檔一律完整）")
     parser.add_argument("--dump-columns", action="store_true", help="輸出欄位偵測診斷")
     args = parser.parse_args()
 
-    if not os.path.isfile(args.pdf):
-        sys.exit("找不到 PDF: %s" % args.pdf)
+    inputs, is_batch = collect_inputs(args)
+    if is_batch and args.compare:
+        sys.exit("--compare 僅適用於單檔模式；PDF/ 沒有基準答案，"
+                 "請改看輸出目錄中的 summary 檔")
+
+    for path in inputs:
+        if not os.path.isfile(path):
+            sys.exit("找不到 PDF: %s" % path)
 
     models = args.model or [DEFAULT_MODEL]
     try:
@@ -510,123 +763,86 @@ def main():
         with open(args.compare, "r", encoding="utf-8") as f:
             expected = json.load(f)
 
-    out_base = os.path.join(resolve_out_dir(args.out_dir), args.out_base)
+    out_dir = resolve_out_dir(args.out_dir)
     slug = timestamp_slug()
 
-    log("解析 PDF 文字層: %s" % os.path.basename(args.pdf))
-    pages, grids = extract_grid(args.pdf, args.max_pages, args.dump_columns)
-    n_columns = choose_column_count(pages)
-    if not n_columns:
-        sys.exit("[error] 找不到可用的表格欄位，可能是掃描件（無文字層）")
-
-    allowed_pages = [i for i, p in enumerate(pages) if p["n_columns"] == n_columns]
-    log("表格欄數: %d（符合此欄數的頁: %s）"
-        % (n_columns, ", ".join(str(pages[i]["page"]) for i in allowed_pages)))
-    for i, page in enumerate(pages):
-        if page["n_columns"] and page["n_columns"] != n_columns:
-            log("[warn] 第 %d 頁欄數 %d 與多數頁不同，將於套用 mapping 時跳過"
-                % (page["page"], page["n_columns"]))
-
-    samples = pick_samples(grids, allowed_pages, max(1, args.samples))
-    log("取樣 %d 列給 LLM 判斷欄位語意" % len(samples))
-    prompt = build_prompt(samples, n_columns)
+    if is_batch:
+        # 批次結果寫到子目錄，且檔名不以 result. 開頭，
+        # 避免被 compare_results.py（glob result.*.json 且假設同一份基準答案）
+        # 誤認成 豐泰.pdf 的結果。
+        out_dir = os.path.join(out_dir, "pdf_batch")
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
+    out_base = os.path.join(out_dir, args.out_base)
 
     summary = []
     for model in models:
         log("")
-        log("=== 模型 %s | 路線 D（LLM 只判欄位語意） ===" % model)
-        started_at = now_iso()
-        call_started = time.time()
-        result, diagnostics, error = run_route_d(
-            args.host, args, model, pages, grids, n_columns, prompt)
-        elapsed = time.time() - call_started
-
-        if error:
+        log("########## 模型 %s | 路線 D（LLM 只判欄位語意） ##########" % model)
+        infos = []
+        for path in inputs:
             log("")
-            log("[error] 路線 D 未產生結果: %s" % error)
-            summary.append({"model": model, "recordCount": None, "error": error})
-            continue
+            log("--- %s ---" % os.path.basename(path))
+            info = process_pdf(args.host, args, model, path, args.dump_columns)
+            infos.append(info)
 
-        diagnostics["pages"] = pages
+            if info["error"]:
+                log("  [error] %s" % info["error"])
+                continue
 
-        result["data"], ocr_fixed = apply_ocr_fixes(result.get("data", []))
-        if ocr_fixed:
-            log("  OCR 失真修正: %d 筆" % ocr_fixed)
+            stem = os.path.splitext(os.path.basename(path))[0]
+            tag = "%s.textmap" % model.replace(":", "_")
+            if is_batch:
+                out_path = os.path.join(out_dir, "fentay.%s.%s.json" % (stem, tag))
+            else:
+                out_path = "%s.%s.json" % (out_base, tag)
+            report_path = "%s.%s.report.txt" % (out_path[:-len(".json")], slug)
 
-        problems = validate(result)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(info["result"], f, ensure_ascii=False, indent=2)
 
-        build_output(
-            result,
-            source={
-                "route": "D",
-                "mode": "hybrid",
-                "input": "text-layer",
-                "llmRole": "column-mapping",
-                "model": model,
-                "pdf": os.path.basename(args.pdf),
-                "samples": len(samples),
-                "mappingRuns": args.runs,
-                "mappingAgreed": diagnostics["agreed"],
-                "mapping": diagnostics["mapping"],
-                "pages": len([p for p in pages if p["n_columns"] == n_columns]),
-                "ocrColorCodeFixed": ocr_fixed,
-            },
-            elapsed_sec=elapsed,
-            started_at=started_at,
-        )
+            text = build_report(
+                args, model, info["result"], info["diagnostics"],
+                info["problems"], info["elapsed"], info["started_at"],
+                info["ocr_fixed"], info["cross_check"], info["agreement"],
+                info["pdf"], out_path, report_path)
+            if expected is not None:
+                text += ("\n\n=== 與基準答案比對 ===\n"
+                         "注意: 本路線的資料值層與路線 C 同源（共用文字層擷取函式），\n"
+                         "      因此比對結果只有『欄位語意』具備獨立性，\n"
+                         "      資料擷取層的獨立證據請看上面的 QTY x PRICE 交叉驗證。\n\n"
+                         + compare(expected, info["result"],
+                                   show=args.show_diffs, full=True))
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(text)
 
-        tag = "%s.textmap" % model.replace(":", "_")
-        out_path = "%s.%s.json" % (out_base, tag)
-        report_path = "%s.%s.%s.report.txt" % (out_base, tag, slug)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
+            info["out_path"] = out_path
+            info["report_path"] = report_path
+            log("  已輸出: %s" % out_path)
+            log("  完整報告: %s" % report_path)
+        summary.extend(infos)
 
-        # 獨立交叉驗證：重新從 PDF 取「金額」欄，不依賴 expected.json。
-        # 註：此處沿用 pdf_text_fentay.collect_amounts，其內部以 infer_fields
-        # 定位訂單欄，僅作為金額字典的鍵，不影響本路線受測的欄位 mapping。
-        log("  執行獨立交叉驗證 (QTY x PRICE vs 金額)...")
-        cross_check = {"verified": 0, "mismatches": [], "total": len(result["data"])}
-        try:
-            amounts = pt.collect_amounts(args.pdf)
-            verified, mismatches = pt.cross_validate(result["data"], amounts)
-            cross_check["verified"] = verified
-            cross_check["mismatches"] = mismatches
-        except Exception as exc:
-            log("[warn] 交叉驗證執行失敗: %s" % exc)
-            cross_check["error"] = str(exc)
-
-        with open(report_path, "w", encoding="utf-8") as f:
-            f.write(build_report(args, model, result, diagnostics, expected, problems,
-                                 elapsed, started_at, ocr_fixed, cross_check,
-                                 out_path, report_path))
-
-        if expected is not None:
+    if is_batch:
+        for model in models:
+            text_path, json_path = write_summary(out_dir, model, summary)
             log("")
-            log(compare(expected, result, show=args.show_diffs))
-        log("")
-        log("已輸出: %s" % out_path)
-        log("完整報告: %s" % report_path)
+            log("批次彙總: %s" % text_path)
+            log("批次彙總(JSON): %s" % json_path)
+            log("")
+            with open(text_path, "r", encoding="utf-8") as f:
+                log(f.read())
 
-        summary.append({
-            "model": model,
-            "recordCount": result.get("recordCount"),
-            "validation_issues": len(problems),
-            "elapsed_sec": round(elapsed, 1),
-            "report": report_path,
-        })
-
-    log("")
     log("===== 彙總 =====")
     log("  產出時間: %s" % now_iso())
     for item in summary:
-        if item.get("error"):
-            log("  %-14s 失敗: %s" % (item["model"], item["error"]))
+        if item["error"]:
+            log("  %-14s 失敗: %s" % (item["pdf"], item["error"]))
             continue
-        log("  %-14s recordCount=%-4s 驗證問題=%-3d 耗時=%.1fs"
-            % (item["model"], item["recordCount"],
-               item["validation_issues"], item["elapsed_sec"]))
-    log("  輸出目錄: %s" % os.path.dirname(out_base))
-    if any(item.get("error") for item in summary):
+        log("  %-14s recordCount=%-4s 驗證問題=%-3d 交叉驗證=%s/%s 耗時=%.1fs"
+            % (item["pdf"], item["recordCount"], item["validation_issues"],
+               item["cross_verified"], item["recordCount"], item["elapsed_sec"]))
+    log("  輸出目錄: %s" % out_dir)
+    if any(item["error"] for item in summary):
         sys.exit(1)
 
 

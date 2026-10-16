@@ -87,6 +87,12 @@ ACTIONS = [
                  "--out-base", "result", "--compare", "expected.json",
                  "--dump-columns"]),
 
+    Action("8", "路線 D 批次：PDF/ 全部真實訂單", "10 份，約 35 秒",
+           argv=["pdf_text_llm_fentay.py", "--pdf-dir", "PDF",
+                 "--model", "qwen3.5:4b", "--samples", "10", "--runs", "1",
+                 "--dump-columns"],
+           requires=["PDF"]),
+
     Action("0", "離開", needs_pdf=False, exit=True),
 ]
 
